@@ -57,6 +57,13 @@ from transformers import (AutoConfig, AutoModelForCausalLM, GenerationMixin,
                           PretrainedConfig, PreTrainedModel)
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:  # 无 Triton 环境（CPU-only）自动回退到可微参考实现
+    HAS_TRITON = False
+
 
 # ============================================================
 # 工具函数（与官方对齐）
@@ -467,6 +474,148 @@ class BoundedSwiGLU(nn.Module):
         return self.w_down(F.silu(gate) * up)
 
 
+# ------------------------------------------------------------
+# Triton grouped GEMM：MoE 专家批量分发（替代 Python for 循环）
+# 路由行按专家排序成 CSR 段 (offs)，一个 kernel 的 grid 覆盖
+# (专家 × 该专家行块 × 列块)，全部专家一次并行算完。
+# ------------------------------------------------------------
+if HAS_TRITON:
+    @triton.jit
+    def _grouped_gemm_kernel(
+            A, W, SEL, OFFS, OUT,
+            N, K,
+            stride_am, stride_ak,
+            stride_we, stride_wn, stride_wk,
+            stride_om, stride_on,
+            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+            IP: tl.constexpr):
+        """out[m, :] = a[SEL[m], :] @ w[e(m), :, :].T，行 m 属于专家 e 的
+        CSR 段 [OFFS[e], OFFS[e+1])——分发（gather）在 kernel 内完成。"""
+        e = tl.program_id(0)
+        blk_m = tl.program_id(1)
+        blk_n = tl.program_id(2)
+        base = tl.load(OFFS + e).to(tl.int32)
+        cnt = tl.load(OFFS + e + 1).to(tl.int32) - base
+        m_start = base + blk_m * BM
+        if m_start >= base + cnt:            # 该专家行不够这个块，直接退出
+            return
+        offs_m = m_start + tl.arange(0, BM)
+        offs_n = blk_n * BN + tl.arange(0, BN)
+        offs_k = tl.arange(0, BK)
+        m_mask = offs_m < base + cnt
+        n_mask = offs_n < N
+        sel = tl.load(SEL + offs_m, mask=m_mask, other=0)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            k_mask = offs_k < (K - k0)
+            a = tl.load(A + sel[:, None] * stride_am
+                        + (offs_k + k0)[None, :] * stride_ak,
+                        mask=m_mask[:, None] & k_mask[None, :],
+                        other=0.0).to(tl.float32)
+            w = tl.load(W + e * stride_we + offs_n[:, None] * stride_wn
+                        + (offs_k + k0)[None, :] * stride_wk,
+                        mask=n_mask[:, None] & k_mask[None, :],
+                        other=0.0).to(tl.float32)
+            acc += tl.dot(a, tl.trans(w), input_precision=IP)
+        tl.store(OUT + offs_m[:, None] * stride_om
+                 + offs_n[None, :] * stride_on, acc,
+                 mask=m_mask[:, None] & n_mask[None, :])
+
+    @triton.jit
+    def _grouped_dw_kernel(
+            DOUT, A, SEL, OFFS, DW,
+            N, K,
+            stride_dm, stride_dn,
+            stride_am, stride_ak,
+            stride_de, stride_dw_n, stride_dw_k,
+            BN: tl.constexpr, BK: tl.constexpr, TM: tl.constexpr,
+            IP: tl.constexpr):
+        """dW[e] = DOUT[seg_e].T @ A[SEL[seg_e]]——专家段内的转置 GEMM。"""
+        e = tl.program_id(0)
+        blk_n = tl.program_id(1)
+        blk_k = tl.program_id(2)
+        base = tl.load(OFFS + e).to(tl.int32)
+        cnt = tl.load(OFFS + e + 1).to(tl.int32) - base
+        if cnt == 0:
+            return
+        offs_n = blk_n * BN + tl.arange(0, BN)
+        offs_k = blk_k * BK + tl.arange(0, BK)
+        n_mask = offs_n < N
+        k_mask = offs_k < K
+        acc = tl.zeros((BN, BK), dtype=tl.float32)
+        for m0 in range(0, cnt, TM):         # 沿该专家的行段分块累加
+            offs_m = base + m0 + tl.arange(0, TM)
+            m_mask = offs_m < base + cnt
+            sel = tl.load(SEL + offs_m, mask=m_mask, other=0)
+            d = tl.load(DOUT + offs_m[:, None] * stride_dm
+                        + offs_n[None, :] * stride_dn,
+                        mask=m_mask[:, None] & n_mask[None, :],
+                        other=0.0).to(tl.float32)
+            a = tl.load(A + sel[:, None] * stride_am
+                        + offs_k[None, :] * stride_ak,
+                        mask=m_mask[:, None] & k_mask[None, :],
+                        other=0.0).to(tl.float32)
+            acc += tl.dot(tl.trans(d), a, input_precision=IP)
+        tl.store(DW + e * stride_de + offs_n[:, None] * stride_dw_n
+                 + offs_k[None, :] * stride_dw_k, acc,
+                 mask=n_mask[:, None] & k_mask[None, :])
+
+    class _GroupedGEMM(torch.autograd.Function):
+        """y[m] = a[SEL[m]] @ w[e(m)].T，前后向都是 Triton kernel：
+        反向 dW 走 _grouped_dw_kernel，dA 复用前向 kernel（A 换成 dY）后
+        index_add 回原 token。无 Python 专家循环。
+        a:[T,K]  w:[E,N,K]  SEL:[M] int32  OFFS:[E+1] int32  maxc:最大段长。"""
+
+        @staticmethod
+        def forward(ctx, a, w, sel, offs, maxc):
+            E, N, K = w.shape
+            out = torch.empty(sel.numel(), N, device=a.device,
+                              dtype=torch.float32)
+            _grouped_gemm_kernel[(
+                E, triton.cdiv(maxc, 32), triton.cdiv(N, 64))](
+                a, w, sel, offs, out, N, K,
+                a.stride(0), a.stride(1),
+                w.stride(0), w.stride(1), w.stride(2),
+                out.stride(0), out.stride(1),
+                BM=32, BN=64, BK=64, IP="ieee")
+            ctx.save_for_backward(a, w, sel, offs)
+            ctx.maxc = maxc
+            return out
+
+        @staticmethod
+        def backward(ctx, dout):
+            a, w, sel, offs = ctx.saved_tensors
+            E, N, K = w.shape
+            dout = dout.contiguous()
+            dw = torch.zeros(E, N, K, device=w.device, dtype=torch.float32)
+            _grouped_dw_kernel[(
+                E, triton.cdiv(N, 64), triton.cdiv(K, 64))](
+                dout, a, sel, offs, dw, N, K,
+                dout.stride(0), dout.stride(1),
+                a.stride(0), a.stride(1),
+                dw.stride(0), dw.stride(1), dw.stride(2),
+                BN=64, BK=64, TM=32, IP="ieee")
+            # dA = dY @ W[e]：转置视角的 grouped GEMM——输出维=K(a 的特征维)、
+            # 归约维=N(dY 的特征维)，w 的两个内维步长随之对调。
+            # dY 的行就是分组行 m（前向 out 的行空间），故 SEL 取 arange(M)，
+            # 与 token 空间的 sel 无关；sel 只用于下面 index_add 回原行
+            M = sel.numel()
+            sel_m = torch.arange(M, device=dout.device, dtype=torch.int32)
+            da_rows = torch.empty(M, K, device=dout.device,
+                                  dtype=torch.float32)
+            _grouped_gemm_kernel[(
+                E, triton.cdiv(ctx.maxc, 32), triton.cdiv(K, 64))](
+                dout, w, sel_m, offs, da_rows, K, N,
+                dout.stride(0), dout.stride(1),
+                w.stride(0), w.stride(2), w.stride(1),
+                da_rows.stride(0), da_rows.stride(1),
+                BM=32, BN=64, BK=64, IP="ieee")
+            da = torch.zeros(a.shape[0], K, device=dout.device,
+                             dtype=torch.float32).index_add(
+                0, sel.long(), da_rows)
+            return da.to(a.dtype), dw.to(w.dtype), None, None, None
+
+
 class MiniMoE(nn.Module):
     """sqrtsoftplus 打分 + noaux_tc 修正偏置 + norm_topk + routed_scaling。
     官方语义修正：bias 只参与选择，权重取未加偏置的原始分数。
@@ -500,6 +649,51 @@ class MiniMoE(nn.Module):
             self._sel_counts = cnt
         return cnt
 
+    def _packed_experts(self):
+        """从 ModuleList 打包专家权重为 3D 张量（checkpoint 仍以 ModuleList
+        为源，格式不变；8×128×64 量级，逐前向打包开销可忽略）。"""
+        st = torch.stack
+        w_gate = st([e.w_gate.weight for e in self.experts])   # [E,I,H]
+        w_up = st([e.w_up.weight for e in self.experts])       # [E,I,H]
+        w_down = st([e.w_down.weight for e in self.experts])   # [E,H,I]
+        b_gate = st([e.w_gate.bias for e in self.experts])     # [E,I]
+        b_up = st([e.w_up.bias for e in self.experts])         # [E,I]
+        b_down = st([e.w_down.bias for e in self.experts])     # [E,H]
+        return w_gate, w_up, w_down, b_gate, b_up, b_down
+
+    def _expert_rows(self, x_flat, sel, e_sorted, offs, maxc):
+        """按路由分组并行执行全部专家的 SwiGLU MLP，返回 [M,H] 行
+        （未乘路由权重，含各层 bias）。
+        CUDA+Triton：grouped GEMM kernel 分发；否则纯 torch einsum 参考
+        实现（一次算全部专家再按路由行取）——两条路径都无 Python 专家循环。"""
+        w_gate, w_up, w_down, b_gate, b_up, b_down = self._packed_experts()
+        limit = self.experts[0].limit
+        M = sel.numel()
+        device = x_flat.device
+        use_triton = HAS_TRITON and x_flat.is_cuda
+        if use_triton:
+            sel_tok = sel.to(torch.int32)                      # gate/up：按 token 取行
+            sel_row = torch.arange(M, device=device,
+                                   dtype=torch.int32)          # down：act 已分组
+            gate = _GroupedGEMM.apply(x_flat, w_gate, sel_tok, offs, maxc)
+            up = _GroupedGEMM.apply(x_flat, w_up, sel_tok, offs, maxc)
+        else:
+            aw = x_flat.float()
+            gate_all = torch.einsum('tk,enk->ten', aw, w_gate.float())
+            up_all = torch.einsum('tk,enk->ten', aw, w_up.float())
+            gate = gate_all[sel, e_sorted]
+            up = up_all[sel, e_sorted]
+        gate = gate + b_gate.float()[e_sorted]
+        up = up + b_up.float()[e_sorted]
+        act = F.silu(gate.clamp(max=limit)) * up.clamp(-limit, limit)
+        if use_triton:
+            rows = _GroupedGEMM.apply(act, w_down, sel_row, offs, maxc)
+        else:
+            down_all = torch.einsum('mk,ehk->meh', act, w_down.float())
+            row = torch.arange(M, device=device)
+            rows = down_all[row, e_sorted]
+        return rows + b_down.float()[e_sorted]
+
     def forward(self, x):
         shape = x.shape
         x_flat = x.view(-1, shape[-1])
@@ -518,14 +712,27 @@ class MiniMoE(nn.Module):
                              torch.ones_like(indices, dtype=cnt.dtype).view(-1))
             counts += cnt.cpu()
 
-        routed = torch.zeros_like(x_flat)
-        for k in range(self.top_k):
-            for e in range(self.n_experts):
-                m = indices[:, k] == e
-                if m.any():
-                    routed[m] += self.experts[e](x_flat[m]) * weights[m, k, None]
+        # 路由扁平化 + 按专家排序 -> CSR 段偏移（全张量算子，无 Python 循环）
+        T, H = x_flat.shape
+        E = self.n_experts
+        tok_by_row = torch.arange(T, device=x.device).repeat_interleave(self.top_k)
+        expert_by_row = indices.reshape(-1)
+        order = torch.argsort(expert_by_row, stable=True)
+        sel = tok_by_row[order]                    # [M] 每行对应的 token
+        e_sorted = expert_by_row[order]            # [M] 每行对应的专家
+        w_sorted = weights.reshape(-1)[order]      # [M] 路由权重
+        offs = torch.zeros(E + 1, device=x.device, dtype=torch.int32)
+        offs[1:] = torch.bincount(expert_by_row,
+                                  minlength=E).cumsum(0).to(torch.int32)
+        # 段长分布只用于定 kernel grid；cnt 已在上面同步到 CPU，无额外同步
+        maxc = max(int(cnt.max()), 1)
 
-        out = routed * self.scale + self.shared_expert(x_flat)
+        rows = self._expert_rows(x_flat, sel, e_sorted, offs, maxc)
+        routed = torch.zeros(T, H, device=x.device,
+                             dtype=rows.dtype).index_add(
+            0, sel, rows * w_sorted[:, None].to(rows.dtype))
+
+        out = (routed * self.scale).to(x_flat.dtype) + self.shared_expert(x_flat)
         return out.view(shape)
 
     @torch.no_grad()

@@ -39,6 +39,14 @@
     拼接→o_b），o_lora_rank 语义为每组的秩。
   - Router：bias 只参与选择，权重取原始分数（官方 TopKRouter 语义）。
   - SwiGLU clamp 在激活前（gate max=limit、up ±limit）。
+  - MoE 分发：专家 Python for 循环已改写为 **Triton grouped GEMM**——路由行
+    argsort+bincount 成 CSR 段，`_GroupedGEMM`（autograd.Function）前向用
+    `_grouped_gemm_kernel`、反向 dW 用 `_grouped_dw_kernel`（grid=专家×行块×列块，
+    kernel 内按 SEL gather 分发），dA 复用前向 kernel（转置视角）后 index_add
+    回原 token；全部 kernel 内 fp32 ieee 累加。非 CUDA 或无 triton 回退到
+    einsum 参考实现（一次算全部专家再按路由行取，同样无循环）。
+    `experts` 仍是 nn.ModuleList（checkpoint 唯一源），逐前向 stack 打包
+    （8×128×64 量级，开销可忽略）；triton 随 torch 自带（3.8.0），无需另装。
   - indexer 打分官方公式 ∑_h w_h·ReLU(q·K)·d^-0.5，w=weights_proj(x)·H^-0.5。
   - 双 rope 缓存 main(θ=10000)/compress(θ=16000，官方 160000 等比缩)，
     KV 存储层 ratio>0 用 compress，复用层 q 跟随 source 存储类型。
@@ -49,12 +57,16 @@
 - V4.1 独有字段（官方亦无源码，[INFERRED]）：MTP（fuse(h_t, emb(t+1)) 预测 t+2，
   S>=2 才算、loss 权重 mtp_loss_coef=0.3，labels 已是 shift 好的 next-token 目标）、
   engram（n-gram 哈希查表 + 零初始化投影注入）。`dspark_*` 仍占位未实现（留 v3）。
-- 验收基线（v2）：train loss 0.0049，4 条训练内 prompt greedy 全命中，
-  indexer 密度 ~0.31，本体 3.56M 参数（总 36.7M 含 embed+head）
+- 验收基线（v2 + Triton MoE 分发）：train loss 0.0056（44.5s，原 for 循环 58s），
+  4 条训练内 prompt greedy 全命中，indexer 密度 ~0.31，
+  本体 3.56M 参数（总 36.7M 含 embed+head）
 - 修 meta 设备陷阱：`from_pretrained` 会把普通属性留在 meta 设备，
   `MiniMoE._ensure_counts()` 懒重建统计张量——别直接碰 `_sel_counts`
 - 冒烟方法：causality 断言（改未来 token → 前缀 logits diff < 1e-4）+
-  S ∈ {1,3,7,48,49} 前向/反向有限（含 MTP 损失路径），改模型后先跑这个再训练
+  S ∈ {1,3,7,48,49} 前向/反向有限（含 MTP 损失路径），改模型后先跑这个再训练；
+  改 MoE 还要跑等价测试：monkeypatch `model_v41.HAS_TRITON` 切换 Triton 与
+  einsum 参考两条路径，前向 + 对 x/全部专家参数的梯度逐一 allclose
+  （fp32 下前向应逐位一致，bf16 走 autocast 容差 2e-2）
 
 ## 陷阱（改动前必读）
 
