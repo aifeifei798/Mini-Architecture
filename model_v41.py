@@ -1,23 +1,51 @@
 """Mini DeepSeek V4.1 — 最小架构研究实现（纯文本，无 vision）。
 
-对应官方 deepseek_v41 text_config 的组件（v1 已实现）：
-  - MLA：q_lora / kv_lora / o_lora 分组输出 / 解耦 RoPE（qk_rope_head_dim）
-  - MoE：sqrtsoftplus 打分 + noaux_tc 均衡偏置 + norm_topk + routed_scaling
-  - 稀疏注意力：sliding window + indexer topk token + block 候选
-  - Hyper-Connections：hc_mult 路残差流 + Sinkhorn 混合
-  - 跨层 KV 压缩复用：kv_source_layer_ids + compress_ratios
+v2（本轮）：用 transformers 5.20.2 内置的官方 deepseek_v4 源码逐组件校准，
+并实现 V4.1 独有字段中可落地的部分。
 
-标注 [INFERRED] 的地方：官方源码不可用，按 config 字段命名与 DeepSeek 公开
-论文惯例推断实现，语义可能与官方不完全一致。
+官方对照结论（transformers/models/deepseek_v4/ 为 V4.0，与 V4.1 共享组件）：
+  - Hyper-Connections 官方叫 mHC：每个子层（attn/ffn）各一个模块，单个 fn
+    参数产 pre/post/comb 三组权重；pre 在模块内收拢流、post 缩放子层输出、
+    comb（softmax + Sinkhorn 行列归一双随机）混合旧流，消费方向为转置
+    （new_k = Σ_j comb[j,k]·old_j）。流初始为 embedding 的 N 份拷贝（无缩放），
+    末端由 HyperHead（只含 pre 型权重）收拢。v2 完全按此重写。
+  - 注意力：单 KV 头直接投影 hidden→head_dim（**无 kv_lora 低秩**——V4 弃用了
+    V3 的 MLA 压缩），K=V 共用张量；部分 RoPE 只旋转头部尾部 rope 维
+    （[nope|rope] 布局、interleaved 相邻成对配对、fp32 计算）；输出对 rope 维
+    做共轭旋转（-sin）；每头可学习 attention sink（进 softmax 分母、不进加权和）。
+  - o_groups：分组低秩输出投影——每组独立投影到 o_lora_rank（官方该字段是
+    每组的秩），拼接后单个 o_b 线性混合回 hidden。
+  - Router：选择用 scores+bias，权重取**未加偏置**的原始分数归一化后乘
+    routed_scaling_factor。
+  - SwiGLU clamp：作用在激活前的 gate(max=limit) 与 up(±limit)。
+  - indexer 打分官方为 ∑_h w_h·ReLU(q·K)·d^-0.5，w=weights_proj(x)·H^-0.5
+    （可学习逐头权重）。v2 按此替换 v1 的 max-pool 打分。
+  - compress_rope_theta：官方有 main/compress 两套 rope，滑窗层用
+    main(θ=10000)，压缩层与 indexer 用 compress(θ=160000)。mini 映射：
+    KV 存储层 ratio>0 用 compress，否则 main；复用层 q 跟随 source 的存储
+    类型（保证 q·k 同 θ）。
+  - 官方 V4.0 的 compress_rates dict + layer_types（CSA/HCA 层内压缩自身
+    KV）与 V4.1 的 compress_ratios + kv_source_layer_ids（跨层 KV 复用）是
+    两套机制；后者官方无源码，仍为 [INFERRED]。v2 细化：source 存 raw roped
+    KV，各层按自身 ratio 池化读取（只池化一层，修正 v1 的双重池化）。
 
-v2 保留字段（未实现，传非空值不生效）：
-  num_nextn_predict_layers / engram_* / dspark_*
-  rope_scaling(yarn) — S<=48 不需要，纯 RoPE theta=10000。
+V4.1 独有字段实现（官方亦无源码，[INFERRED]）：
+  - MTP（num_nextn_predict_layers）：训练期辅助损失——fuse(h_t, emb(t+1))
+    经 1 个轻量块（单头注意力 + SwiGLU）用共享 lm_head 预测 t+2，
+    loss 权重 mtp_loss_coef。生成时不启用（labels=None），不影响主路径。
+  - engram（engram_layer_ids）：n-gram（1..max_ngram）多项式哈希查表记忆，
+    加权求和经零初始化投影注入 hidden。官方 3.84 亿行大表缩为
+    engram_table_size 行。
+  - dspark_*：仍为占位字段（未实现）。它是推理侧块推测解码头（noise token
+    起步、Markov 低秩转移、独立 MoE），S<=48 的训练研究价值低且语义推断
+    空间最大，留 v3。
 
 设计取舍（相对原 config 的有意缩小，均已验证可训）：
-  - compress_ratios 尾 0 改 1，使第 7 层复用第 6 层（覆盖 r=1 直接复用路径，
-    否则第 6 层作为 source 无人使用）
-  - index_topk_blocks 2048 -> 4（S=48 时 8 块会退化成近稠密，观察不到稀疏性）
+  - compress_ratios 尾部 3 个 0 改 1，使第 7 层复用第 6 层
+  - candidate_topk_blocks 2048 -> 4（S=48 时大 topk 退化成近稠密）
+  - hc_sinkhorn_iters 保留官方 20（矩阵只有 4x4，开销可忽略）
+  - rope_scaling(yarn) 未实现——S<=48 不需要，纯 RoPE
+  - 玩具式 eager 实现，非官方缓存/压缩器流水线
 """
 
 import math
@@ -31,10 +59,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 # ============================================================
-# 工具函数
+# 工具函数（与官方对齐）
 # ============================================================
 def rope_cache(seq_len, rot_dim, theta, device, dtype):
-    """标准 RoPE 频率缓存。rot_dim 为每头旋转维度（qk_rope_head_dim）。"""
+    """RoPE 半尺寸频率缓存（interleaved：每个交错对一个 θ）。"""
     inv_freq = 1.0 / (theta**(torch.arange(0, rot_dim, 2, device=device,
                                             dtype=torch.float32) / rot_dim))
     t = torch.arange(seq_len, device=device, dtype=torch.float32)
@@ -42,52 +70,62 @@ def rope_cache(seq_len, rot_dim, theta, device, dtype):
     return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
 
+def rotate_half(x):
+    """interleaved 旋转：相邻两通道成对 (x0,x1) -> (-x1,x0)。"""
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
 def apply_rope(x, cos, sin):
-    """x: (B, H, S, R)，cos/sin: (S, R/2)。rotate-half 式旋转。"""
-    d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    cos = cos[None, None]
-    sin = sin[None, None]
-    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    """x: (B,H,S,hd)，头部布局 [nope|rope]，只旋转尾部 rope 维（官方 V4 语义）。
+    cos/sin: (S, rope_dim/2)，先 repeat_interleave 展开再旋转，fp32 计算。"""
+    cos = cos.repeat_interleave(2, dim=-1)[None, None]
+    sin = sin.repeat_interleave(2, dim=-1)[None, None]
+    rope_dim = cos.shape[-1]
+    nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
+    rotated = ((rope.float() * cos) + (rotate_half(rope).float() * sin)).to(x.dtype)
+    return torch.cat([nope, rotated], dim=-1)
 
 
-def sinkhorn(raw, iters, eps=1e-6):
-    """[INFERRED] Sinkhorn 归一化：exp 后行列交替归一，近似双随机矩阵。"""
-    m = torch.exp(raw.clamp(-20.0, 20.0))
-    for _ in range(iters):
-        m = m / (m.sum(-1, keepdim=True) + eps)
-        m = m / (m.sum(-2, keepdim=True) + eps)
+def unweighted_rms_norm(x, eps):
+    """官方 mHC 的输入归一化：无权重 RMSNorm。"""
+    return x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+def sinkhorn_stochastic(m, iters, eps):
+    """官方 mHC Sinkhorn：输入已是正权重（softmax 后），列归一化起步，
+    之后行/列交替 iters-1 轮，收敛到近似双随机。"""
+    m = m / (m.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(iters - 1):
+        m = m / (m.sum(dim=-1, keepdim=True) + eps)
+        m = m / (m.sum(dim=-2, keepdim=True) + eps)
     return m
 
 
-def hc_mix(mat, X):
-    """mat: (B,S,n,n)，X: (B,S,n,H) -> (B,S,n,H)。out_i = sum_m mat[i,m] * X[m]"""
-    return torch.einsum('bsnm,bsmh->bsnh', mat, X)
-
-
 def causal_pool_read(latent, r):
-    """[INFERRED] 因果安全的 KV latent 均值池化读取。
+    """[INFERRED] 因果安全的 KV 池化读取（r>1 时）。
 
-    块 k 覆盖位置 [k*r, (k+1)*r-1]，存储时池化为 1/r。
-    读取规则（保证位置 p 只看到 <= p 的信息）：
+    块 k 覆盖位置 [k*r, (k+1)*r-1]。读取规则（位置 p 只看到 <= p 的信息）：
       p 是块尾 (p % r == r-1) -> 读本块（恰好截止 p）
       否则                    -> 读上一块（截止 < p），p<r 时退回原始 latent
-    训练时 eager 模式会重新展开为 (S,D)；缓存压缩收益属于推理侧优化。
     """
     if r <= 1:
         return latent
-    B, S, D = latent.shape
+    B, S = latent.shape[:2]
     n_full = S // r
     if n_full == 0:
         return latent
-    pooled = latent[:, :n_full * r].view(B, n_full, r, D).mean(dim=2)
+    pooled = latent[:, :n_full * r].reshape(B, n_full, r, -1).mean(dim=2)
+    pooled = pooled.view(B, n_full, *latent.shape[2:])
     pos = torch.arange(S, device=latent.device)
     k = torch.div(pos, r, rounding_mode='floor')
     is_tail = (pos % r) == (r - 1)
     src = torch.where(is_tail, k, k - 1)
     valid = src >= 0
-    gathered = pooled[:, src.clamp(min=0), :]
-    return torch.where(valid.view(1, S, 1), gathered, latent)
+    gathered = pooled[:, src.clamp(min=0)]
+    return torch.where(valid.view(1, S, *([1] * (latent.dim() - 2))), gathered,
+                       latent)
 
 
 # ============================================================
@@ -105,19 +143,20 @@ class MiniV41Config(PretrainedConfig):
                  head_dim=32,
                  qk_rope_head_dim=8,
                  q_lora_rank=32,
-                 kv_lora_rank=32,
-                 o_lora_rank=32,
+                 o_lora_rank=16,          # 官方语义：每组的秩（非总秩）
                  o_groups=2,
                  rms_norm_eps=1e-6,
                  initializer_range=0.02,
                  rope_theta=10000.0,
+                 compress_rope_theta=16000.0,   # 官方 160000，mini 等比缩小
                  # 稀疏注意力
                  sliding_window=16,
                  index_n_heads=4,
                  index_head_dim=16,
                  index_topk=8,
-                 index_block_size=4,
-                 index_topk_blocks=4,
+                 candidate_source_layer_id=2,
+                 candidate_block_size=4,
+                 candidate_topk_blocks=4,
                  # MoE
                  n_routed_experts=8,
                  num_experts_per_tok=2,
@@ -125,15 +164,24 @@ class MiniV41Config(PretrainedConfig):
                  moe_intermediate_size=64,
                  swiglu_limit=10.0,
                  routed_scaling_factor=1.5,
-                 # Hyper-Connections
+                 # Hyper-Connections（mHC）
                  hc_mult=4,
-                 hc_sinkhorn_iters=3,
-                 # 跨层 KV 压缩复用
+                 hc_sinkhorn_iters=20,    # 官方值（4x4 矩阵，开销可忽略）
+                 hc_eps=1e-6,
+                 # 跨层 KV 压缩复用 [INFERRED]
                  compress_ratios=(0, 0, 2, 2, 2, 1, 1, 1),
                  kv_source_layer_ids=(2, 6),
-                 # v2 保留字段（未实现）
-                 num_nextn_predict_layers=0,
-                 engram_layer_ids=(),
+                 index_source_layer_ids=(2, 6),
+                 # MTP [INFERRED]（mini 用 1 层，官方 3）
+                 num_nextn_predict_layers=1,
+                 mtp_loss_coef=0.3,
+                 # engram [INFERRED]（mini 缩小版）
+                 engram_layer_ids=(1, 3),
+                 engram_max_ngram_size=4,
+                 engram_vocab_size=4096,        # 哈希空间（官方 16000000）
+                 engram_table_size=1024,        # 每层表行数（官方 ~3.84e8）
+                 # 保留占位（未实现）
+                 dspark_block_size=5,
                  dspark_target_layer_ids=(),
                  **kwargs):
         super().__init__(**kwargs)
@@ -145,18 +193,19 @@ class MiniV41Config(PretrainedConfig):
         self.head_dim = head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
         self.o_lora_rank = o_lora_rank
         self.o_groups = o_groups
         self.rms_norm_eps = rms_norm_eps
         self.initializer_range = initializer_range
         self.rope_theta = rope_theta
+        self.compress_rope_theta = compress_rope_theta
         self.sliding_window = sliding_window
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
-        self.index_block_size = index_block_size
-        self.index_topk_blocks = index_topk_blocks
+        self.candidate_source_layer_id = candidate_source_layer_id
+        self.candidate_block_size = candidate_block_size
+        self.candidate_topk_blocks = candidate_topk_blocks
         self.n_routed_experts = n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
@@ -165,10 +214,17 @@ class MiniV41Config(PretrainedConfig):
         self.routed_scaling_factor = routed_scaling_factor
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
+        self.hc_eps = hc_eps
         self.compress_ratios = list(compress_ratios)
         self.kv_source_layer_ids = list(kv_source_layer_ids)
+        self.index_source_layer_ids = list(index_source_layer_ids)
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.mtp_loss_coef = mtp_loss_coef
         self.engram_layer_ids = list(engram_layer_ids)
+        self.engram_max_ngram_size = engram_max_ngram_size
+        self.engram_vocab_size = engram_vocab_size
+        self.engram_table_size = engram_table_size
+        self.dspark_block_size = dspark_block_size
         self.dspark_target_layer_ids = list(dspark_target_layer_ids)
 
 
@@ -176,55 +232,81 @@ AutoConfig.register("deepseek_v41_mini", MiniV41Config)
 
 
 # ============================================================
-# Hyper-Connections（残差流扩展 + 动态混合）
+# mHC（官方语义：pre 收拢 / post 缩放 / comb 双随机混合）
 # ============================================================
-class HyperConnections(nn.Module):
-    """[INFERRED] HC：残差流扩为 n 路，动态混合矩阵经 Sinkhorn 归一。
+class HyperConnection(nn.Module):
+    """官方 mHC 子模块（每个 attn/ffn 子层各一个）。
 
-    - expand: 每路乘固定缩放 [1, .7, .5, .3] 打破初始对称（否则各路永远相同）
-    - mix_in :  X_in = sinkhorn(I + dyn_in(s))  ⊗ X    →  本层变换的输入
-    - mix_out:  X    = X + sinkhorn(I + dyn_out(y)) ⊗ y →  HC 持有残差
-    块内部无残差（由 HC 统一持有，避免双重缩放）。
+    单个 fn 参数 ((2+N)*N, N*hidden) 从 N 路流（摊平+无权重 RMSNorm）线性
+    产出三组权重：
+      pre  (N,)  : sigmoid(w*pre_scale + base) + eps —— 模块内收拢流
+      post (N,)  : 2*sigmoid(...) —— 子层输出的逐流缩放
+      comb (N,N) : softmax(...) + eps，经 Sinkhorn 行列归一成双随机 —— 旧流混合
+    comb 以转置方向消费：new_k = Σ_j comb[j,k] * old_j（对第一根流轴求和）。
+    权重 fp32 计算（官方 _keep_in_fp32_modules 含 attn_hc）。
     """
 
-    def __init__(self, hidden, n, iters):
+    def __init__(self, hidden, n, iters, eps):
         super().__init__()
         self.n = n
         self.iters = iters
-        self.dyn_in = nn.Linear(hidden, n * n)
-        self.dyn_out = nn.Linear(hidden, n * n)
-        for lin in (self.dyn_in, self.dyn_out):
-            nn.init.zeros_(lin.weight)
-            nn.init.zeros_(lin.bias)
-        scale = [1.0, 0.7, 0.5, 0.3][:n]
-        scale += [scale[-1]] * (n - len(scale))
-        self.register_buffer('stream_scale', torch.tensor(scale))
-        self.register_buffer('eye', torch.eye(n))
+        self.eps = eps
+        self.fn = nn.Parameter(torch.empty((2 + n) * n, n * hidden))
+        self.base = nn.Parameter(torch.empty((2 + n) * n))
+        self.scale = nn.Parameter(torch.empty(3))
 
-    def expand(self, x):
-        # (B,S,H) -> (B,S,n,H)
-        return x.unsqueeze(2) * self.stream_scale.view(1, 1, -1, 1)
+    def forward(self, streams):
+        """streams: (B,S,N,H) -> (post (B,S,N), comb (B,S,N,N), collapsed (B,S,H))"""
+        B, S = streams.shape[:2]
+        n = self.n
+        flat = unweighted_rms_norm(streams.flatten(2), self.eps)
+        w = F.linear(flat.float(), self.fn.float())
+        pre_w, post_w, comb_w = w.split([n, n, n * n], dim=-1)
+        pre_b, post_b, comb_b = self.base.float().split([n, n, n * n])
+        pre_scale, post_scale, comb_scale = self.scale.float().unbind(0)
 
-    def mix_in(self, X):
-        s = X.mean(dim=2)                                   # (B,S,H)
-        raw = self.dyn_in(s).view(*s.shape[:2], self.n, self.n) + self.eye
-        return hc_mix(sinkhorn(raw, self.iters), X)
+        comb_w = comb_w.view(B, S, n, n)
+        comb_b = comb_b.view(n, n)
 
-    def mix_out(self, X, y):
-        s = y.mean(dim=2)
-        raw = self.dyn_out(s).view(*s.shape[:2], self.n, self.n) + self.eye
-        return X + hc_mix(sinkhorn(raw, self.iters), y)
+        pre = torch.sigmoid(pre_w * pre_scale + pre_b) + self.eps
+        post = 2.0 * torch.sigmoid(post_w * post_scale + post_b)
+        comb = torch.softmax(comb_w * comb_scale + comb_b, dim=-1) + self.eps
+        comb = sinkhorn_stochastic(comb, self.iters, self.eps)
+
+        collapsed = (pre.unsqueeze(-1) * streams.float()).sum(dim=2)
+        return post, comb, collapsed.to(streams.dtype)
+
+
+class HyperHead(nn.Module):
+    """官方末端收拢（HyperHead）：只有 pre 型权重，把 N 路流折成 1 路。"""
+
+    def __init__(self, hidden, n, eps):
+        super().__init__()
+        self.n = n
+        self.eps = eps
+        self.fn = nn.Parameter(torch.empty(n, n * hidden))
+        self.base = nn.Parameter(torch.empty(n))
+        self.scale = nn.Parameter(torch.empty(1))
+
+    def forward(self, streams):
+        flat = unweighted_rms_norm(streams.flatten(2), self.eps)
+        w = F.linear(flat.float(), self.fn.float())
+        pre = torch.sigmoid(w * self.scale.float()
+                            + self.base.float()) + self.eps
+        return (pre.unsqueeze(-1) * streams.float()).sum(dim=2).to(streams.dtype)
 
 
 # ============================================================
-# 稀疏注意力 Indexer
+# 稀疏注意力 Indexer（官方 Lightning-Indexer 打分 + 玩具版选择结构）
 # ============================================================
 class SparseIndexer(nn.Module):
-    """[INFERRED] indexer：滑窗 ∪ topk token ∪ topk block，且强制因果。
+    """打分对齐官方：∑_h w_h · ReLU(q·K)·d^-0.5，w=weights_proj(x)·H^-0.5。
+    选择结构保持玩具版：滑窗 ∪ topk token ∪ topk block（V4.1 块候选字段
+    candidate_* 语义 [INFERRED]），强制因果。
 
-    同时输出 index 分数作为注意力加性 bias（保证 indexer 有梯度通路，
-    topk 选择本身不可导）。每层独立 indexer（官方用 index_source_layer_ids
-    跨层共享，玩具版从简）。
+    同时输出打分作为注意力加性 bias（topk 不可导，bias 保证梯度通路）。
+    模块按 index_source_layer_ids 跨层共享（source 层持有参数，其余层引用）。
+    last_density 由 Block 记录，避免共享时相互覆盖。
     """
 
     def __init__(self, hidden, n_heads, head_dim, topk, block_size, topk_blocks,
@@ -238,16 +320,22 @@ class SparseIndexer(nn.Module):
         self.window = window
         self.q_proj = nn.Linear(hidden, n_heads * head_dim)
         self.k_proj = nn.Linear(hidden, n_heads * head_dim)
-        self.last_density = 1.0   # 诊断用：上次前向的可见 token 比例
+        self.weights_proj = nn.Linear(hidden, n_heads)
+        self.softmax_scale = head_dim ** -0.5
+        self.weights_scaling = n_heads ** -0.5
 
     def forward(self, x):
-        """x: (B,S,H) -> (mask: (B,1,S,S) bool, bias: (B,1,S,S) float)"""
+        """x: (B,S,H) -> (mask (B,1,S,S) bool, bias (B,1,S,S) float)"""
         B, S, H = x.shape
         device = x.device
         q = self.q_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        idx_scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        idx_scores = idx_scores.max(dim=1).values               # (B,S,S)
+
+        # 官方打分：ReLU 逐头内积 + 可学习逐头权重求和
+        scores = F.relu(q.float() @ k.float().transpose(-2, -1)) * self.softmax_scale
+        weights = self.weights_proj(x).float() * self.weights_scaling  # (B,S,H)
+        weights = weights.transpose(1, 2).unsqueeze(-1)                # (B,H,S,1)
+        idx_scores = (scores * weights).sum(dim=1)                     # (B,S,S)
 
         causal = torch.ones(S, S, dtype=torch.bool, device=device).tril()
         idx_scores = idx_scores.masked_fill(~causal, float('-inf'))
@@ -260,15 +348,13 @@ class SparseIndexer(nn.Module):
 
         # block topk：按 key 维切块取均值分
         bs = self.block_size
-        nb_pad = (S + bs - 1) // bs
-        pad_len = nb_pad * bs - S
-        padded = F.pad(idx_scores, (0, pad_len), value=float('-inf'))
-        block_scores = padded.view(B, S, nb_pad, bs).mean(dim=-1)
-        # 只有包含 <= i 位置的块才可选（避免全 -inf 块影响 topk）
-        block_ok = causal.any(dim=-1, keepdim=False)
         n_real = (S + bs - 1) // bs
+        pad_len = n_real * bs - S
+        padded = F.pad(idx_scores, (0, pad_len), value=float('-inf'))
+        block_scores = padded.view(B, S, n_real, bs).mean(dim=-1)
+        # 只有包含 <= i 位置的块才可选
         pos_b = torch.arange(n_real, device=device) * bs
-        block_ok = (pos_b.view(1, -1) <= torch.arange(S, device=device).view(-1, 1))
+        block_ok = pos_b.view(1, -1) <= torch.arange(S, device=device).view(-1, 1)
         block_scores = block_scores.masked_fill(~block_ok, float('-inf'))
         kb = min(self.topk_blocks, n_real)
         blk = block_scores.topk(kb, dim=-1).indices
@@ -286,18 +372,21 @@ class SparseIndexer(nn.Module):
         mask = mask.unsqueeze(1)                                  # (B,1,S,S)
         bias = idx_scores.masked_fill(~causal, 0.0).clamp(-10.0, 10.0)
         bias = bias.unsqueeze(1)
-        self.last_density = mask.float().mean().item()
         return mask, bias
 
 
 # ============================================================
-# MLA 注意力
+# 注意力（官方 V4 语义：单头 K=V 直投 + 部分 interleaved RoPE +
+# 共轭旋转 + attention sink + 分组低秩输出）
 # ============================================================
 class MiniMLA(nn.Module):
-    """MLA（迷你）：q/kv/o 低秩 + 解耦 RoPE + 单 KV 头（MQA）+ 分组输出投影。
-
-    owns_kv=False 的层不带 kv_down（复用 source 层的 latent，见 Model）。
-    k/v 由共享 latent 经本层 k_up/v_up 解码（跨层复用存储的是 latent）。
+    """V4 注意力（迷你）：
+    - q 低秩（q_lora_rank），q_a_norm/q_b_norm 双归一
+    - kv 直接投影 hidden→head_dim（单头，无 kv_lora——V4 弃用 V3 的 MLA 低秩），
+      K=V 共用；RoPE 只旋转尾部 rope 维，输出做共轭旋转
+    - 每头可学习 attention sink：softmax 分母多一列 exp(sink)，不参与加权和
+    - o 分组低秩：每组投影到 o_lora_rank，拼接后 o_b 混合回 hidden
+    - owns_kv=False 的层不带 kv_proj，复用 source 层 KV（跨层复用 [INFERRED]）
     """
 
     def __init__(self, config, owns_kv=True):
@@ -305,71 +394,65 @@ class MiniMLA(nn.Module):
         c = config
         self.heads = c.num_attention_heads
         self.head_dim = c.head_dim
-        self.rope_dim = c.qk_rope_head_dim
-        self.nope_dim = c.head_dim - c.qk_rope_head_dim
         self.q_down = nn.Linear(c.hidden_size, c.q_lora_rank)
+        self.q_a_norm = nn.RMSNorm(c.q_lora_rank, eps=c.rms_norm_eps)
         self.q_up = nn.Linear(c.q_lora_rank, self.heads * c.head_dim)
-        self.kv_down = (nn.Linear(c.hidden_size, c.kv_lora_rank)
+        self.q_b_norm = nn.RMSNorm(c.head_dim, eps=c.rms_norm_eps)
+        self.kv_proj = (nn.Linear(c.hidden_size, c.head_dim)
                         if owns_kv else None)
-        self.k_up = nn.Linear(c.kv_lora_rank, self.nope_dim)   # 单 KV 头
-        self.v_up = nn.Linear(c.kv_lora_rank, c.head_dim)
-        self.k_pe = nn.Linear(c.hidden_size, c.qk_rope_head_dim)
-        # 分组输出：o_groups 组，每组 head 子集独立低秩投影后求和
+        self.kv_norm = nn.RMSNorm(c.head_dim, eps=c.rms_norm_eps)
+        self.sinks = nn.Parameter(torch.zeros(self.heads))
+        # 分组输出投影：每组 -> o_lora_rank，拼接 -> o_b -> hidden（官方结构）
         self.groups = c.o_groups
         assert self.heads % self.groups == 0
-        self.heads_per_group = self.heads // self.groups
-        gdim = self.heads_per_group * c.head_dim
-        grank = max(c.o_lora_rank // self.groups, 1)
+        gdim = (self.heads // self.groups) * c.head_dim
         self.o_down = nn.ModuleList(
-            [nn.Linear(gdim, grank) for _ in range(self.groups)])
-        self.o_up = nn.ModuleList(
-            [nn.Linear(grank, c.hidden_size) for _ in range(self.groups)])
+            [nn.Linear(gdim, c.o_lora_rank) for _ in range(self.groups)])
+        self.o_b = nn.Linear(c.o_groups * c.o_lora_rank, c.hidden_size)
 
-    def forward(self, x, s_mix, latent, cos, sin, mask, bias):
-        """x: (Bn,S,H) 各流查询；s_mix: (B,S,H)；latent: (B,S,kv_lora)。
-        mask/bias: (B,1,S,S)，会随流重复。返回 (Bn,S,H)。"""
-        Bn, S, H = x.shape
-        B = latent.shape[0]
-        n_stream = Bn // B
+    def project_kv(self, x, cos, sin):
+        """source 层调用：(B,S,H) -> roped KV (B,S,1,hd)（K=V 共用）。"""
+        kv = self.kv_norm(self.kv_proj(x)).view(*x.shape[:-1], 1, self.head_dim)
+        return apply_rope(kv.transpose(1, 2), cos, sin).transpose(1, 2)
 
-        q = self.q_up(self.q_down(x)).view(Bn, S, self.heads, self.head_dim)
-        q = q.transpose(1, 2)
-        q_nope, q_rope = q.split([self.nope_dim, self.rope_dim], dim=-1)
-        q_rope = apply_rope(q_rope, cos, sin)
-        q = torch.cat([q_nope, q_rope], dim=-1)                 # (Bn,Hd,S,hd)
+    def forward(self, x, kv, cos, sin, mask, bias):
+        """x: (B,S,H) 收拢后的查询流；kv: (B,S,1,hd) 已含 rope 的共享 KV。
+        mask/bias: (B,1,S,S)。返回 (B,S,H)。"""
+        B, S, H = x.shape
 
-        # 单 KV 头：latent 解码 nope 部分，s_mix 提供 rope 部分
-        k_nope = self.k_up(latent).view(B, S, 1, self.nope_dim)
-        k_rope = self.k_pe(s_mix).view(B, S, 1, self.rope_dim)
-        k_rope = apply_rope(k_rope.transpose(1, 2), cos, sin).transpose(1, 2)
-        v = self.v_up(latent).view(B, S, 1, self.head_dim)
+        q = self.q_up(self.q_a_norm(self.q_down(x)))
+        q = q.view(B, S, self.heads, self.head_dim).transpose(1, 2)
+        q = self.q_b_norm(q)
+        q = apply_rope(q, cos, sin)                              # (B,Hd,S,hd)
 
-        k = torch.cat([k_nope, k_rope], dim=-1)                  # (B,S,1,hd)
-        k = k.repeat_interleave(n_stream, dim=0)                 # (Bn,S,1,hd)
-        v = v.repeat_interleave(n_stream, dim=0)
-        k = k.transpose(1, 2).expand(Bn, self.heads, S, self.head_dim)
-        v = v.transpose(1, 2).expand(Bn, self.heads, S, self.head_dim)
+        k = kv.transpose(1, 2).expand(B, self.heads, S, self.head_dim)
+        v = k                                                     # K=V
 
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        mask_r = mask.repeat_interleave(n_stream, dim=0)         # (Bn,1,S,S)
-        bias_r = bias.repeat_interleave(n_stream, dim=0)
-        scores = scores + bias_r
-        scores = scores.masked_fill(~mask_r, float('-inf'))
-        attn = F.softmax(scores.float(), dim=-1).to(q.dtype)
-        out = (attn @ v).transpose(1, 2).reshape(Bn, S, self.heads * self.head_dim)
+        scores = scores + bias
+        scores = scores.masked_fill(~mask, float('-inf'))
+        # attention sink：分母多一列 exp(sink)，该质量不进入输出
+        sink_col = self.sinks.view(1, self.heads, 1, 1).expand(
+            B, self.heads, S, 1)
+        attn = F.softmax(torch.cat([scores.float(), sink_col.float()],
+                                   dim=-1), dim=-1)
+        out = (attn[..., :-1] @ v.float()).to(q.dtype)            # (B,Hd,S,hd)
 
-        # 分组输出投影
-        out_g = out.view(Bn, S, self.groups, -1)
-        y = sum(self.o_up[g](self.o_down[g](out_g[:, :, g]))
-                for g in range(self.groups))
-        return y
+        # 共轭旋转：V 带 key 侧 rope，在查询位置转回来（官方 -sin）
+        out = apply_rope(out, cos, -sin)
+        out = out.transpose(1, 2).reshape(B, S, self.heads * self.head_dim)
+
+        # 分组低秩输出投影
+        out_g = out.view(B, S, self.groups, -1)
+        parts = [self.o_down[g](out_g[:, :, g]) for g in range(self.groups)]
+        return self.o_b(torch.cat(parts, dim=-1))
 
 
 # ============================================================
 # MoE
 # ============================================================
 class BoundedSwiGLU(nn.Module):
-    """激活 clamp 到 ±limit 的 SwiGLU（swiglu_limit=10）。"""
+    """官方语义：clamp 在激活前——gate clamp(max=limit)，up clamp(±limit)。"""
 
     def __init__(self, in_features, hidden_features, limit=10.0):
         super().__init__()
@@ -379,16 +462,15 @@ class BoundedSwiGLU(nn.Module):
         self.limit = limit
 
     def forward(self, x):
-        gate = torch.clamp(F.silu(self.w_gate(x)), max=self.limit)
-        up = torch.clamp(self.w_up(x), min=-self.limit, max=self.limit)
-        return self.w_down(gate * up)
+        gate = self.w_gate(x).clamp(max=self.limit)
+        up = self.w_up(x).clamp(min=-self.limit, max=self.limit)
+        return self.w_down(F.silu(gate) * up)
 
 
 class MiniMoE(nn.Module):
     """sqrtsoftplus 打分 + noaux_tc 修正偏置 + norm_topk + routed_scaling。
-
-    _sel_counts 记录累计被选次数（供 update_expert_balance 与诊断读取，
-    不入 checkpoint）。e_score_correction_bias 持久化。
+    官方语义修正：bias 只参与选择，权重取未加偏置的原始分数。
+    _sel_counts 记录累计被选次数（诊断用，不入 checkpoint）。
     """
 
     def __init__(self, config):
@@ -422,10 +504,12 @@ class MiniMoE(nn.Module):
         shape = x.shape
         x_flat = x.view(-1, shape[-1])
 
-        scores = torch.sqrt(
-            F.softplus(self.gate(x_flat)) + 1e-6) + self.e_score_correction_bias
-        weights, indices = torch.topk(scores, self.top_k, dim=-1)
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
+        scores = torch.sqrt(F.softplus(self.gate(x_flat)) + 1e-6)
+        # 选择用 scores+bias；权重用原始 scores（官方 TopKRouter 语义）
+        indices = torch.topk(scores + self.e_score_correction_bias,
+                             self.top_k, dim=-1).indices
+        weights = scores.gather(1, indices)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
 
         with torch.no_grad():
             counts = self._ensure_counts()
@@ -468,36 +552,140 @@ class MiniMoE(nn.Module):
 
 
 # ============================================================
+# Engram 记忆（n-gram 哈希查表注入）[INFERRED]
+# ============================================================
+class EngramMemory(nn.Module):
+    """对每个位置，取结尾 1..max_ngram 的 n-gram 做多项式哈希 -> 查本层小表，
+    按可学习权重求和，经零初始化投影注入 hidden（起点为零注入，训练中长出）。
+    哈希只用 <= 当前位置的 token（不足长度的位置以 0 填充前缀），因果安全。
+    官方是 3.84 亿行大表 + 多头读取；这里缩为 engram_table_size 行加性注入。
+    """
+
+    def __init__(self, hidden, max_ngram, hash_mod, table_size):
+        super().__init__()
+        self.max_ngram = max_ngram
+        self.hash_mod = hash_mod
+        self.tables = nn.ModuleList(
+            [nn.Embedding(table_size, hidden) for _ in range(max_ngram)])
+        self.mix = nn.Parameter(torch.zeros(max_ngram))     # 各 n-gram 权重
+        self.proj = nn.Linear(hidden, hidden)
+        nn.init.zeros_(self.proj.weight)                    # 零注入起步
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, input_ids):
+        """input_ids: (B,S) -> delta (B,S,H)"""
+        B, S = input_ids.shape
+        device = input_ids.device
+        prime = 1000003
+        w = torch.softmax(self.mix, dim=0)
+        read = None
+        for n in range(1, self.max_ngram + 1):
+            # 结尾 n-gram 的多项式哈希：h[p] = Σ_i input_ids[p-n+i]·prime^(n-1-i)
+            # 前 n-1 个位置用 0 填充（退化 gram，确定性且无未来信息）
+            h = torch.zeros(B, S, dtype=torch.long, device=device)
+            for i in range(n):
+                L = max(S - (n - 1 - i), 0)
+                shifted = F.pad(input_ids[:, :L], (S - L, 0), value=0)
+                h = (h * prime + shifted) % self.hash_mod
+            idx = h % self.tables[n - 1].num_embeddings
+            emb_n = w[n - 1] * self.tables[n - 1](idx)
+            read = emb_n if read is None else read + emb_n
+        return self.proj(read)
+
+
+# ============================================================
+# MTP 模块（训练期辅助预测 t+2）[INFERRED]
+# ============================================================
+class MTPModule(nn.Module):
+    """DeepSeek 式 MTP 迷你版：fuse(h_t, emb(t+1)) -> 1 个轻量块（单头注意力 +
+    SwiGLU）-> 共享 lm_head 预测 t+2。只在 labels 存在时参与训练损失。"""
+
+    def __init__(self, config):
+        super().__init__()
+        c = config
+        self.fuse = nn.Linear(2 * c.hidden_size, c.hidden_size)
+        self.norm1 = nn.RMSNorm(c.hidden_size, eps=c.rms_norm_eps)
+        self.q = nn.Linear(c.hidden_size, c.hidden_size)
+        self.k = nn.Linear(c.hidden_size, c.hidden_size)
+        self.v = nn.Linear(c.hidden_size, c.hidden_size)
+        self.o = nn.Linear(c.hidden_size, c.hidden_size)
+        self.norm2 = nn.RMSNorm(c.hidden_size, eps=c.rms_norm_eps)
+        self.ffn = BoundedSwiGLU(c.hidden_size, c.hidden_size,
+                                 c.swiglu_limit)
+        self.norm3 = nn.RMSNorm(c.hidden_size, eps=c.rms_norm_eps)
+
+    def forward(self, h, emb_next, cos, sin, lm_head):
+        """h: (B,S,H) 最终 hidden；emb_next: (B,S,H) t+1 真值 embedding。
+        返回 (B,S,V) logits。"""
+        x = self.fuse(torch.cat([h, emb_next], dim=-1))
+        B, S, H = x.shape
+        res = x
+        x = self.norm1(x)
+        q = self.q(x).view(B, S, 1, H).transpose(1, 2)
+        k = self.k(x).view(B, S, 1, H).transpose(1, 2)
+        v = self.v(x).view(B, S, 1, H).transpose(1, 2)
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        causal = torch.ones(S, S, dtype=torch.bool,
+                            device=x.device).tril().view(1, 1, S, S)
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(H)
+        scores = scores.masked_fill(~causal, float('-inf'))
+        attn = F.softmax(scores.float(), dim=-1).to(q.dtype)
+        x = res + self.o((attn @ v).squeeze(1))
+        x = x + self.ffn(self.norm2(x))
+        return lm_head(self.norm3(x))
+
+
+# ============================================================
 # Block
 # ============================================================
 class V41Block(nn.Module):
-    """pre-norm 块：y = attn(norm1(s)) + moe(norm2(s))。
-
-    无内部残差——残差由 Hyper-Connections 统一持有（见 mix_out）。
-    s = X_in.mean(2)（各流约简）；indexer 每层独立；kv_down 只在 source 层。
+    """官方结构：attn_hc 收拢流 -> attn -> post/comb 混合 -> ffn_hc -> moe ->
+    混合。块内部无残差（mHC 统一持有）。own 层在块内算 KV 并写入 latents；
+    reuse 层从 latents 读 source 的 KV 按自身 ratio 池化。indexer 跨层共享。
     """
 
-    def __init__(self, config, owns_kv):
+    def __init__(self, config, kv_plan, indexer):
         super().__init__()
         c = config
+        self.kv_plan = kv_plan                    # ('own', i, r) | ('reuse', j, r)
+        self.attn_hc = HyperConnection(c.hidden_size, c.hc_mult,
+                                       c.hc_sinkhorn_iters, c.hc_eps)
+        self.ffn_hc = HyperConnection(c.hidden_size, c.hc_mult,
+                                      c.hc_sinkhorn_iters, c.hc_eps)
         self.norm1 = nn.RMSNorm(c.hidden_size, eps=c.rms_norm_eps)
-        self.attn = MiniMLA(c, owns_kv=owns_kv)
+        self.attn = MiniMLA(c, owns_kv=(kv_plan[0] == 'own'))
         self.norm2 = nn.RMSNorm(c.hidden_size, eps=c.rms_norm_eps)
         self.moe = MiniMoE(c)
-        self.indexer = SparseIndexer(c.hidden_size, c.index_n_heads,
-                                     c.index_head_dim, c.index_topk,
-                                     c.index_block_size, c.index_topk_blocks,
-                                     c.sliding_window)
+        # 共享 indexer 不在此注册（否则 state_dict 出现重复张量），由模型顶层
+        # self.indexers 唯一注册，这里仅持引用
+        self._indexer_ref = [indexer]
+        self.last_density = 1.0   # 诊断：上次前向可见 token 比例
 
-    def forward(self, X_in, s_mix, latent, cos, sin):
-        """X_in: (B,S,n,H)；latent: (B,S,kv_lora)。返回 y: (B,S,n,H)。"""
-        B, S, n, H = X_in.shape
-        mask, bias = self.indexer(s_mix)
-        x_flat = X_in.reshape(B * n, S, H)
-        a = self.attn(self.norm1(x_flat), s_mix, latent, cos, sin, mask, bias)
-        a = a.view(B, n, S, H).transpose(1, 2)
-        m = self.moe(self.norm2(X_in))
-        return a + m
+    def forward(self, X, cos, sin, cos_kv, sin_kv, latents):
+        """X: (B,S,N,H) 流；cos/sin 为本层 q 的 rope；cos_kv/sin_kv 为 KV 存储
+        时的 rope 类型；latents: dict，own 层写入 raw KV。返回新流 (B,S,N,H)。"""
+        B, S, N, H = X.shape
+        kind, j, ratio = self.kv_plan
+
+        post, comb, collapsed = self.attn_hc(X)
+        if kind == 'own':
+            raw_kv = self.attn.project_kv(collapsed, cos_kv, sin_kv)
+            latents[j] = raw_kv
+            kv = causal_pool_read(raw_kv, ratio)
+        else:
+            kv = causal_pool_read(latents[j], ratio)
+
+        mask, bias = self._indexer_ref[0](collapsed)
+        self.last_density = mask.float().mean().item()
+        a = self.attn(self.norm1(collapsed), kv, cos, sin, mask, bias)
+        X = (post.to(X.dtype).unsqueeze(-1) * a.unsqueeze(-2)
+             + torch.matmul(comb.to(X.dtype).transpose(-1, -2), X))
+
+        post, comb, collapsed = self.ffn_hc(X)
+        m = self.moe(self.norm2(collapsed))
+        X = (post.to(X.dtype).unsqueeze(-1) * m.unsqueeze(-2)
+             + torch.matmul(comb.to(X.dtype).transpose(-1, -2), X))
+        return X
 
 
 # ============================================================
@@ -512,65 +700,91 @@ class MiniV41ForCausalLM(PreTrainedModel, GenerationMixin):
         c = config
         assert len(c.compress_ratios) == c.num_hidden_layers
         self.embed = nn.Embedding(c.vocab_size, c.hidden_size)
-        self.hc = HyperConnections(c.hidden_size, c.hc_mult,
-                                   c.hc_sinkhorn_iters)
+
+        # KV 复用规划 [INFERRED]：own 层自己算，reuse 层取最近 source
         sources = set(c.kv_source_layer_ids)
+        kv_plans = []
+        for i in range(c.num_hidden_layers):
+            r = c.compress_ratios[i]
+            if r == 0 or i in sources:
+                kv_plans.append(('own', i, r))
+            else:
+                kv_plans.append(('reuse', max(s for s in sources if s < i), r))
+        # rope 类型跟随 KV 存储层的 ratio（复用层 q 与 source 存储同 θ，保证
+        # q·k 同一 rope 族；官方语义为滑窗层 main、压缩层 compress）
+        self.rope_is_compress = [
+            (r if kind == 'own' else c.compress_ratios[j]) > 0
+            for kind, j, r in kv_plans]
+
+        # indexer 跨层共享：ratio=0 或 index source 层持有模块，其余层引用
+        # 最近的持有层（index_source_layer_ids 语义 [INFERRED]）
+        idx_sources = set(c.index_source_layer_ids)
+        built = {}
+        for i in range(c.num_hidden_layers):
+            if i in idx_sources or c.compress_ratios[i] == 0:
+                built[i] = SparseIndexer(
+                    c.hidden_size, c.index_n_heads, c.index_head_dim,
+                    c.index_topk, c.candidate_block_size,
+                    c.candidate_topk_blocks, c.sliding_window)
+        indexer_of = [built[i] if i in built
+                      else built[max(s for s in built if s < i)]
+                      for i in range(c.num_hidden_layers)]
+        # 唯一注册点（跨层共享的 indexer 只在此注册一份，block 内持引用，
+        # 避免 state_dict 重复张量）
+        self.indexers = nn.ModuleList([built[i] for i in sorted(built)])
+
         self.blocks = nn.ModuleList([
-            V41Block(c, owns_kv=(i in sources or c.compress_ratios[i] == 0))
+            V41Block(c, kv_plans[i], indexer_of[i])
             for i in range(c.num_hidden_layers)
         ])
-        # 每层复用哪个 source：本身是 source 或 ratio=0 -> 自己算；
-        # 否则取最近的 <= 自己的 source（config 保证存在）
-        self.kv_reuse = []
-        for i in range(c.num_hidden_layers):
-            if c.compress_ratios[i] == 0:
-                self.kv_reuse.append(('own', i, 0))
-            elif i in sources:
-                self.kv_reuse.append(('own', i, c.compress_ratios[i]))
-            else:
-                src = max(s for s in sources if s < i)
-                self.kv_reuse.append(('reuse', src, c.compress_ratios[i]))
+
+        self.hc_head = HyperHead(c.hidden_size, c.hc_mult, c.hc_eps)
         self.norm_f = nn.RMSNorm(c.hidden_size, eps=c.rms_norm_eps)
         self.lm_head = nn.Linear(c.hidden_size, c.vocab_size)
+
+        # MTP / Engram
+        self.mtp = (MTPModule(c) if c.num_nextn_predict_layers > 0 else None)
+        self.engrams = nn.ModuleList([
+            EngramMemory(c.hidden_size, c.engram_max_ngram_size,
+                         c.engram_vocab_size, c.engram_table_size)
+            for _ in range(len(c.engram_layer_ids))])
         self.post_init()
 
     def _init_weights(self, module):
+        std = self.config.initializer_range
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0,
-                                       std=self.config.initializer_range)
+            module.weight.data.normal_(mean=0.0, std=std)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 module.bias.data.zero_()
+        elif isinstance(module, (HyperConnection, HyperHead)):
+            nn.init.normal_(module.fn, mean=0.0, std=std)
+            nn.init.zeros_(module.base)
+            nn.init.ones_(module.scale)
 
     def forward(self, input_ids=None, labels=None, **kwargs):
         c = self.config
         B, S = input_ids.shape
         device = input_ids.device
+        dtype = self.embed.weight.dtype
 
-        cos, sin = rope_cache(S, c.qk_rope_head_dim, c.rope_theta, device,
-                              self.embed.weight.dtype)
+        # 两套 rope 缓存：main / compress（官方双 rope 语义）
+        caches = {name: rope_cache(S, c.qk_rope_head_dim, theta, device, dtype)
+                  for name, theta in (("main", c.rope_theta),
+                                      ("compress", c.compress_rope_theta))}
+
         x = self.embed(input_ids)
-        X = self.hc.expand(x)                       # (B,S,n,H)
+        engram_map = dict(zip(c.engram_layer_ids, self.engrams))
+        X = x.unsqueeze(2).expand(-1, -1, c.hc_mult, -1).contiguous()
+
         latents = {}
-
         for i, block in enumerate(self.blocks):
-            kind, j, ratio = self.kv_reuse[i]
-            if kind == 'own':
-                # source 层：s_mix 供 kv_down / rope / indexer
-                s_mix = X.mean(dim=2)
-                kv_down = block.attn.kv_down
-                lat = kv_down(s_mix)
-                if ratio > 1:
-                    # 源层也按 ratio 存储（尾部读取时因果安全展开）
-                    lat = causal_pool_read(lat, ratio)
-                latents[i] = lat
-            else:
-                s_mix = X.mean(dim=2)
-                lat = causal_pool_read(latents[j], ratio)
-            X_in = self.hc.mix_in(X)
-            y = block(X_in, s_mix, lat, cos, sin)
-            X = self.hc.mix_out(X, y)
+            name = "compress" if self.rope_is_compress[i] else "main"
+            cos, sin = caches[name]
+            if i in engram_map:
+                X = X + engram_map[i](input_ids).unsqueeze(2)
+            X = block(X, cos, sin, *caches[name], latents)
 
-        h = self.norm_f(X.mean(dim=2))
+        h = self.norm_f(self.hc_head(X))
         logits = self.lm_head(h)
 
         loss = None
@@ -580,6 +794,18 @@ class MiniV41ForCausalLM(PreTrainedModel, GenerationMixin):
                 labels.view(-1),
                 ignore_index=-100,
             )
+            # MTP 辅助损失：fuse(h_t, emb(t+1)) 预测 t+2（S>=2 才有 shift 目标）
+            if self.mtp is not None and S >= 2:
+                next_lab = labels.masked_fill(labels == -100, 0)
+                emb_next = self.embed(next_lab)
+                mtp_logits = self.mtp(h, emb_next, *caches["main"],
+                                      self.lm_head)
+                mtp_loss = F.cross_entropy(
+                    mtp_logits[:, :-1].reshape(-1, c.vocab_size).float(),
+                    labels[:, 1:].reshape(-1),
+                    ignore_index=-100,
+                )
+                loss = loss + c.mtp_loss_coef * mtp_loss
         return CausalLMOutputWithPast(loss=loss, logits=logits)
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
@@ -597,8 +823,8 @@ class MiniV41ForCausalLM(PreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def index_density(self):
-        """返回各层 indexer 上次前向的可见 token 比例。"""
-        return [b.indexer.last_density for b in self.blocks]
+        """返回各层上次前向的可见 token 比例（共享 indexer 也不互相覆盖）。"""
+        return [b.last_density for b in self.blocks]
 
     @torch.no_grad()
     def reset_stats(self):
