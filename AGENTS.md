@@ -14,6 +14,9 @@
 
 - `model_v41.py` / `train_v41.py` / `chat_v41.py` / `data_v41.py` — V4.1 主线，见下节
 - `model_v42.py` — v4.2 原型分支：DCT 频域压缩 KV，见「v4.2」节
+- `flashcodec/` — 独立开源包（自带 pyproject/tests/benchmarks/README）：标准
+  (B,H,S,D) 契约的 KV 压缩库（jpeg 频域 / png 差分 + CodecKVCache + HF 热补丁），
+  从 `flashcodec/` 目录内导入（同名布局，父目录导入只会命中命名空间包）
 - `data_long.py` / `train_long.py` / `ablate_long.py` — v3 长上下文主线，见「v3」节
 - `test/smoke_v41.py` — 冒烟测试（causality + S 扫描 + 诊断 API，CPU 可跑）；
   `test/moe_eq_test.py` — MoE Triton vs einsum 参考路径等价测试（需 CUDA）；
@@ -109,12 +112,14 @@ v3 陷阱：
 - MoE 专家路由在该语料上坍缩为每层固定 2 专家（0.50/0.50），noaux_tc 偏置
   修正推不开——已知现象，未解
 
-## v4.2 原型分支（DCT 频域压缩 KV，`model_v42.py`）
+## v4.2 原型分支（DCT/PNG 压缩 KV，`model_v42.py`）
 
 独立 model_type `deepseek_v42_mini`（可与 v41 同进程共存，注册名不冲突）。
-把 v41 的块均值池化（只取 DC 分量）升级为分块正交 DCT-II：完整历史块投影
-到最低 `dct_keep_freqs` 个低频系数再重构（几何压缩比 block/keep），未满块
-保持 raw。因果安全与均值读取同构：块尾读本块重构、非块尾读上一块重构的
+把 v41 的块均值池化（只取 DC 分量）升级为两种压缩读取（`kv_compress_mode`）：
+- **"dct"**（JPEG 式有损频域）：完整历史块投影到最低 `dct_keep_freqs` 个
+  正交 DCT-II 低频系数再重构（几何压缩比 block/keep）；
+- **"png"**（PNG 式无损时域）：块首锚点 + 块内一阶差分按 |Δ| Top-M 裁剪
+  （`png_keep_ratio`，1.0 为逐位无损基线）+ cumsum 重建；差分方差压缩 ~34×。因果安全与均值读取同构：块尾读本块重构、非块尾读上一块重构的
 同相位样本、p<block 读 raw；`forward` 与 `forward_decode` 共用
 `causal_dct_pool_read`，KV cache 天然兼容。原型语义：由 raw latent 现算
 重构（不真正省显存），等价于限制"该位置只能看到历史块的低频骨架"。
