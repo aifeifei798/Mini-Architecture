@@ -119,18 +119,23 @@ v3 陷阱：
 - **"dct"**（JPEG 式有损频域）：完整历史块投影到最低 `dct_keep_freqs` 个
   正交 DCT-II 低频系数再重构（几何压缩比 block/keep）；
 - **"png"**（PNG 式无损时域）：块首锚点 + 块内一阶差分按 |Δ| Top-M 裁剪
-  （`png_keep_ratio`，1.0 为逐位无损基线）+ cumsum 重建；差分方差压缩 ~34×。因果安全与均值读取同构：块尾读本块重构、非块尾读上一块重构的
-同相位样本、p<block 读 raw；`forward` 与 `forward_decode` 共用
-`causal_dct_pool_read`，KV cache 天然兼容。原型语义：由 raw latent 现算
-重构（不真正省显存），等价于限制"该位置只能看到历史块的低频骨架"。
+  （`png_keep_ratio`，1.0 为逐位无损基线）+ cumsum 重建；差分方差压缩 ~34×。
 
-- 配置：`kv_compress_mode`（"mean" 兼容 v41 | "dct"）、`dct_block_size`=8、
-  `dct_keep_freqs`=2；仅 ratio>1 的压缩层走 DCT，ratio<=1 与 v41 一致
+两种模式的因果安全与均值读取同构：块尾读本块重构、非块尾读上一块重构的
+同相位样本、p<block 读 raw；`forward` 与 `forward_decode` 共用读取函数
+（`causal_dct_pool_read` / `causal_png_pool_read`），KV cache 天然兼容。
+原型语义：由 raw latent 现算重构（不真正省显存），等价于限制"该位置只
+能看到历史块的压缩表征"。
+
+- 配置：`kv_compress_mode`（"mean" 兼容 v41 | "dct" | "png"）、
+  `dct_block_size`=8 / `dct_keep_freqs`=2、`png_block_size`=8 /
+  `png_keep_ratio`=0.5；仅 ratio>1 的压缩层走压缩读取，ratio<=1 与 v41 一致
 - 基底为模块级常量缓存（`dct_basis`），矩阵乘实现，keep=block 时无损
-- 单测 `test/test_dct_kv.py`：正交无损（~1e-6）、截断误差随 K 单调、
-  因果安全逐位一致、mean 模式与 v41 逐位一致、KV cache 与全量前向一致
-- 消融：`ablate_long.py` 的 `dct_r8_k2` / `dct_r8_k4`（与 v41 六配置同预算，
-  results.json 统一格式，断点续跑）
+- 单测：`test/test_dct_kv.py`（正交无损/截断单调/因果逐位/mean 回归/KV
+  cache 一致）与 `test/test_png_kv.py`（无损 4.8e-7、方差压缩 34×、因果
+  逐位、KV cache 一致 5.7e-7）
+- 消融：`ablate_long.py` 的 `dct_r8_k2` / `dct_r8_k4` / `png_r8_lossless` /
+  `png_r8_k50`（与 v41 六配置同预算，results.json 统一格式，断点续跑）
 
 ## 陷阱（改动前必读）
 
