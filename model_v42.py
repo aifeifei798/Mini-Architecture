@@ -1,14 +1,19 @@
 """Mini DeepSeek V4.1 — 最小架构研究实现（纯文本，无 vision）。
 
 ═══════════════════════════════════════════════════════════════
-model_v42.py：V4.2 原型分支 —— 频域分块压缩（JPEG/DCT-style）KV Cache
+model_v42.py：V4.2 原型分支 —— 频域/时域两种压缩 KV Cache
 ═══════════════════════════════════════════════════════════════
-v41 的 causal_pool_read 只取时序块的零频直流分量（块均值）。本分支把压缩
-升级为一维分块正交 DCT-II：完整历史块投影到最低 dct_keep_freqs 个低频系数
-再重构（模拟"归档只存低频骨架"的有损压缩），未满块的尾部窗口保持 raw。
-因果安全与均值池化同构：块尾读本块重构、非块尾读上一块重构、p<block 读 raw。
+v41 的 causal_pool_read 只取时序块的零频直流分量（块均值）。本分支提供
+两种升级原型（kv_compress_mode）：
+  - "dct"：一维分块正交 DCT-II——完整历史块投影到最低 dct_keep_freqs 个
+    低频系数再重构（JPEG 式，几何压缩比 block/keep）
+  - "png"：PNG 式预测滤波——块首锚点全精度 + 块内一阶差分 Δ，按 |Δ| Top-M
+    裁剪后锚点 + cumsum 因果重建（png_keep_ratio=1 即逐位无损基线）
+两者的因果安全读取与均值池化同构：块尾读本块重构、非块尾读上一块重构的
+同相位样本、未满块尾部保持 raw。`forward` 与 `forward_decode` 共用同一
+读取函数，KV cache 天然兼容。
 原型语义：逐前向由 raw latent 现算重构（不真正省显存），等价于"该位置只
-能看到历史块的低频骨架"。增量解码路径（forward_decode）同样适用。
+能看到历史块的压缩表征"。增量解码路径（forward_decode）同样适用。
 v2（v4.1 主线）：用 transformers 5.20.2 内置的官方 deepseek_v4 源码逐组件校准，
 并实现 V4.1 独有字段中可落地的部分。
 
@@ -206,6 +211,57 @@ def causal_dct_pool_read(latent, block, keep):
                        latent)
 
 
+def png_block_recon(head, keep_ratio):
+    """PNG 式分块差分重构：head (B,nF,r,H) -> (B,nF,r,H)。
+    块首为锚点（全精度），块内一阶差分 Δ_i = x_i - x_{i-1}，按 |Δ| 幅值
+    每（块,特征）保留 Top-m 步（m = ceil((r-1)*keep_ratio)，m=0 时保 1 步），
+    其余置 0，锚点 + cumsum 因果重建。keep_ratio=1 即逐位无损基线
+ （fp32 舍入 ~1e-7 级）。纯线性 + 离散选择算子，autograd 天然可微
+ （梯度只流向被保留的差分步）。"""
+    anchor = head[:, :, :1, :]                             # (B,nF,1,H)
+    delta = head[:, :, 1:, :] - head[:, :, :-1, :]         # (B,nF,r-1,H)
+    if keep_ratio < 1.0:
+        m = max(1, math.ceil((delta.shape[2]) * keep_ratio))
+        mag = delta.abs()
+        topi = mag.topk(m, dim=2).indices                  # 每(块,特征)Top-m
+        mask = torch.zeros_like(mag, dtype=torch.bool)
+        mask.scatter_(2, topi, True)
+        delta = delta * mask
+    # 重建：位置 0 为锚点，位置 i>=1 为锚点 + 前 i 步差分累加
+    return torch.cat([anchor, anchor + torch.cumsum(delta, dim=2)], dim=2)
+
+
+def causal_png_pool_read(latent, block, keep_ratio):
+    """[INFERRED] 因果安全的 PNG 式预测滤波（一阶差分）压缩读取。
+
+    相邻 token 隐向量高度自相关，差分后方差骤降（低信息熵）；完整块按
+    png_block_recon 压缩重建，读取规则与 causal_pool_read 同构以保证严格
+    因果（p 的视图只依赖 ≤ p 的 latent）：
+      p 是块尾 (p%block == block-1) -> 读本块重构在 p 相位（恰好截止 p）
+      否则（p ≥ block）             -> 读上一块重构在 p 相位（截止 < p）
+      p < block                     -> 退回原始 raw latent
+    原型语义：逐前向由 raw latent 现算差分表征（不真正省显存）。
+    """
+    B, S = latent.shape[:2]
+    H = latent.shape[-1]
+    n_full = S // block
+    if n_full == 0:
+        return latent
+    head = latent[:, :n_full * block].reshape(B, n_full, block, H).float()
+    rec = png_block_recon(head, keep_ratio
+                          ).reshape(B, n_full * block, 1, H).to(latent.dtype)
+
+    pos = torch.arange(S, device=latent.device)
+    off = pos % block
+    is_tail = off == (block - 1)
+    src = torch.where(is_tail, pos // block, pos // block - 1)
+    valid = src >= 0
+    idx = (src.clamp(min=0) * block + off).clamp(max=n_full * block - 1)
+    gathered = rec[:, idx]
+    return torch.where(valid.view(1, S, *([1] * (latent.dim() - 2))), gathered,
+                       latent)
+
+
 # ============================================================
 # Config
 # ============================================================
@@ -261,10 +317,12 @@ class MiniV42Config(PretrainedConfig):
                  # 保留占位（未实现）
                  dspark_block_size=5,
                  dspark_target_layer_ids=(),
-                 # v4.2 频域分块压缩 KV（原型机）
-                 kv_compress_mode="mean",   # "mean"（v41 兼容）| "dct"
+                 # v4.2 频域/时域分块压缩 KV（原型机）
+                 kv_compress_mode="mean",   # "mean"（v41）| "dct" | "png"
                  dct_block_size=8,          # DCT 宏块长度 r
                  dct_keep_freqs=2,          # 保留最低频系数个数 K（<= block）
+                 png_block_size=8,          # PNG 差分宏块长度 r
+                 png_keep_ratio=0.5,        # 差分 Top-M 保留比例（1.0=无损基线）
                  **kwargs):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
@@ -311,8 +369,11 @@ class MiniV42Config(PretrainedConfig):
         self.kv_compress_mode = kv_compress_mode
         self.dct_block_size = dct_block_size
         self.dct_keep_freqs = dct_keep_freqs
+        self.png_block_size = png_block_size
+        self.png_keep_ratio = png_keep_ratio
         assert 1 <= dct_keep_freqs <= dct_block_size, \
             "dct_keep_freqs 必须在 [1, dct_block_size] 内"
+        assert 0 < png_keep_ratio <= 1, "png_keep_ratio 必须在 (0, 1] 内"
 
 
 AutoConfig.register("deepseek_v42_mini", MiniV42Config)
@@ -991,6 +1052,8 @@ class V42Block(nn.Module):
         self.kv_compress_mode = c.kv_compress_mode
         self.dct_block = c.dct_block_size
         self.dct_keep = c.dct_keep_freqs
+        self.png_block = c.png_block_size
+        self.png_keep = c.png_keep_ratio
         self.attn_hc = HyperConnection(c.hidden_size, c.hc_mult,
                                        c.hc_sinkhorn_iters, c.hc_eps)
         self.ffn_hc = HyperConnection(c.hidden_size, c.hc_mult,
@@ -1005,10 +1068,15 @@ class V42Block(nn.Module):
         self.last_density = 1.0   # 诊断：上次前向可见 token 比例
 
     def _kv_read(self, latent, ratio):
-        """v4.2 分发：dct 模式且压缩层（ratio>1）走分块 DCT 重构，
+        """v4.2 分发：dct/png 模式且压缩层（ratio>1）走对应压缩读取，
         其余（ratio<=1 / mean 模式）保持 v41 语义。"""
-        if self.kv_compress_mode == "dct" and ratio > 1:
-            return causal_dct_pool_read(latent, self.dct_block, self.dct_keep)
+        if ratio > 1:
+            if self.kv_compress_mode == "dct":
+                return causal_dct_pool_read(latent, self.dct_block,
+                                            self.dct_keep)
+            if self.kv_compress_mode == "png":
+                return causal_png_pool_read(latent, self.png_block,
+                                            self.png_keep)
         return causal_pool_read(latent, ratio)
 
     def forward(self, X, cos, sin, cos_kv, sin_kv, latents, state=None):

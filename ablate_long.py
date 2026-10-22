@@ -6,9 +6,12 @@
 - idx4/32    稀疏度左/右移（默认 index_topk=8）
 - dense      索引全选 ≈ 全注意力（稀疏注意力的上界参照）
 - no_engram  关 engram 注入
-- dct_r8_k2 / dct_r8_k4   v4.2 频域分块压缩 KV（model_v42.py 分支）：
+- dct_r8_k2 / dct_r8_k4   v4.2 频域压缩 KV（model_v42.py 分支）：
   完整历史块投影到最低 2/4 个 DCT-II 低频系数再重构（几何压缩比 4×/2×），
   因果安全与均值池化同构
+- png_r8_lossless / png_r8_k50   v4.2 时域差分压缩 KV（PNG 预测滤波）：
+  块首锚点 + 块内一阶差分 Top-M 裁剪 + cumsum 重建（1.0=无损基线，0.5=保留
+  变化最大的 50% 差分步）
 
 复用 train_long 的数据管道/训练循环。产出 ./ablate/<name>/ + ablate/results.json
 （逐配置落盘，可删掉某项重跑续上）。
@@ -38,12 +41,16 @@ CONFIGS = {
     "no_engram": dict(engram_layer_ids=()),
 }
 
-# v4.2 频域分块压缩 KV（model_v42.py 原型分支）
+# v4.2 频域/时域压缩 KV（model_v42.py 原型分支）
 V42_CONFIGS = {
     "dct_r8_k2": dict(kv_compress_mode="dct", dct_block_size=8,
                       dct_keep_freqs=2),
     "dct_r8_k4": dict(kv_compress_mode="dct", dct_block_size=8,
                       dct_keep_freqs=4),
+    "png_r8_lossless": dict(kv_compress_mode="png", png_block_size=8,
+                            png_keep_ratio=1.0),
+    "png_r8_k50": dict(kv_compress_mode="png", png_block_size=8,
+                       png_keep_ratio=0.5),
 }
 
 if __name__ == "__main__":
