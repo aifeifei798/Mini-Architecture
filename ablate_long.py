@@ -6,6 +6,9 @@
 - idx4/32    稀疏度左/右移（默认 index_topk=8）
 - dense      索引全选 ≈ 全注意力（稀疏注意力的上界参照）
 - no_engram  关 engram 注入
+- dct_r8_k2 / dct_r8_k4   v4.2 频域分块压缩 KV（model_v42.py 分支）：
+  完整历史块投影到最低 2/4 个 DCT-II 低频系数再重构（几何压缩比 4×/2×），
+  因果安全与均值池化同构
 
 复用 train_long 的数据管道/训练循环。产出 ./ablate/<name>/ + ablate/results.json
 （逐配置落盘，可删掉某项重跑续上）。
@@ -21,6 +24,7 @@ import torch
 
 import train_long as T
 from model_v41 import MiniV41Config, MiniV41ForCausalLM
+from model_v42 import MiniV42Config, MiniV42ForCausalLM
 
 OUT = Path("./ablate")
 OUT.mkdir(exist_ok=True)
@@ -34,6 +38,14 @@ CONFIGS = {
     "no_engram": dict(engram_layer_ids=()),
 }
 
+# v4.2 频域分块压缩 KV（model_v42.py 原型分支）
+V42_CONFIGS = {
+    "dct_r8_k2": dict(kv_compress_mode="dct", dct_block_size=8,
+                      dct_keep_freqs=2),
+    "dct_r8_k4": dict(kv_compress_mode="dct", dct_block_size=8,
+                      dct_keep_freqs=4),
+}
+
 if __name__ == "__main__":
     train_flat = T.load_bin("train.bin")
     val_flat = T.load_bin("val.bin")
@@ -45,13 +57,17 @@ if __name__ == "__main__":
     res_path = OUT / "results.json"
     results = json.loads(res_path.read_text()) if res_path.exists() else {}
 
-    for name, over in CONFIGS.items():
+    all_cfgs = ([(n, o, MiniV41Config, MiniV41ForCausalLM)
+                 for n, o in CONFIGS.items()]
+                + [(n, o, MiniV42Config, MiniV42ForCausalLM)
+                   for n, o in V42_CONFIGS.items()])
+    for name, over, cfg_cls, model_cls in all_cfgs:
         if name in results:
             print(f"⏭️ 跳过 {name}（已有结果 {results[name]['best_val']:.4f}）")
             continue
         print(f"\n{'='*60}\n🔬 配置 {name}: {over or '（默认）'}\n{'='*60}")
-        cfg = MiniV41Config(vocab_size=T.meta["vocab_size"], **over)
-        model = MiniV41ForCausalLM(cfg).to(T.device)
+        cfg = cfg_cls(vocab_size=T.meta["vocab_size"], **over)
+        model = model_cls(cfg).to(T.device)
         n_all = sum(p.numel() for p in model.parameters())
         best_val = T.run_stage(model, train_flat, val_flat, T.PRETRAIN_STEPS,
                                f"abl-{name}", T.PRETRAIN_LR, scaler, amp_dtype,

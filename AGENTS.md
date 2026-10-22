@@ -13,10 +13,12 @@
 ## 文件分工
 
 - `model_v41.py` / `train_v41.py` / `chat_v41.py` / `data_v41.py` — V4.1 主线，见下节
+- `model_v42.py` — v4.2 原型分支：DCT 频域压缩 KV，见「v4.2」节
 - `data_long.py` / `train_long.py` / `ablate_long.py` — v3 长上下文主线，见「v3」节
 - `test/smoke_v41.py` — 冒烟测试（causality + S 扫描 + 诊断 API，CPU 可跑）；
   `test/moe_eq_test.py` — MoE Triton vs einsum 参考路径等价测试（需 CUDA）；
-  `test/kv_cache_test.py` — KV cache 增量解码 vs 全量前向贪心一致 + 计时（需 CUDA）
+  `test/kv_cache_test.py` — KV cache 增量解码 vs 全量前向贪心一致 + 计时（需 CUDA）；
+  `test/test_dct_kv.py` — v4.2 DCT 压缩 KV 单测（正交无损/因果安全/回归）
 - 官方对照参考（只读）：`.venv/lib/python3.12/site-packages/transformers/models/deepseek_v4/`
   （V4.0 建模与 config 源码，v2 校准依据；V4.1 独有字段官方无源码）
 - `tokenizer/` — DeepSeek 系 tokenizer（`PreTrainedTokenizerFast`，vocab 129280）
@@ -106,6 +108,24 @@ v3 陷阱：
   评 SFT、LR 又高，SFT 结果被 best 逻辑整个丢掉且泛化倒退
 - MoE 专家路由在该语料上坍缩为每层固定 2 专家（0.50/0.50），noaux_tc 偏置
   修正推不开——已知现象，未解
+
+## v4.2 原型分支（DCT 频域压缩 KV，`model_v42.py`）
+
+独立 model_type `deepseek_v42_mini`（可与 v41 同进程共存，注册名不冲突）。
+把 v41 的块均值池化（只取 DC 分量）升级为分块正交 DCT-II：完整历史块投影
+到最低 `dct_keep_freqs` 个低频系数再重构（几何压缩比 block/keep），未满块
+保持 raw。因果安全与均值读取同构：块尾读本块重构、非块尾读上一块重构的
+同相位样本、p<block 读 raw；`forward` 与 `forward_decode` 共用
+`causal_dct_pool_read`，KV cache 天然兼容。原型语义：由 raw latent 现算
+重构（不真正省显存），等价于限制"该位置只能看到历史块的低频骨架"。
+
+- 配置：`kv_compress_mode`（"mean" 兼容 v41 | "dct"）、`dct_block_size`=8、
+  `dct_keep_freqs`=2；仅 ratio>1 的压缩层走 DCT，ratio<=1 与 v41 一致
+- 基底为模块级常量缓存（`dct_basis`），矩阵乘实现，keep=block 时无损
+- 单测 `test/test_dct_kv.py`：正交无损（~1e-6）、截断误差随 K 单调、
+  因果安全逐位一致、mean 模式与 v41 逐位一致、KV cache 与全量前向一致
+- 消融：`ablate_long.py` 的 `dct_r8_k2` / `dct_r8_k4`（与 v41 六配置同预算，
+  results.json 统一格式，断点续跑）
 
 ## 陷阱（改动前必读）
 
