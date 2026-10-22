@@ -149,7 +149,7 @@ need the equivalence test; attention/cache changes need the kv test.
 | `tokenizer/` | DeepSeek-family tokenizer (`PreTrainedTokenizerFast`, vocab 129280) |
 
 A standalone spin-off library with the standard `(B,H,S,D)` KV-compression
-contract lives at [flashcodec](https://github.com/aifeifei798/flashcodec).
+contract lives at [flashcodec-kv](https://github.com/aifeifei798/flashcodec-kv).
 
 ## Environment
 
