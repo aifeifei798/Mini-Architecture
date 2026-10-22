@@ -370,9 +370,10 @@ class SparseIndexer(nn.Module):
         blk_mask = blk_mask.unsqueeze(-1).repeat(1, 1, 1, bs)
         blk_mask = blk_mask.view(B, S, n_real * bs)[..., :S]
 
-        # 滑窗
+        # 滑窗（v3.1 修复：原实现 diff 算成 j-i，& causal 后窗口退化为仅
+        # 对角线；现改为意图语义 i-j，即回看 window 个历史位置）
         pos = torch.arange(S, device=device)
-        diff = pos.view(1, -1) - pos.view(-1, 1)                 # i - j
+        diff = pos.view(-1, 1) - pos.view(1, -1)                 # i - j
         win_mask = (diff >= 0) & (diff < self.window)
 
         mask = (win_mask | tok_mask | blk_mask) & causal
@@ -380,6 +381,56 @@ class SparseIndexer(nn.Module):
         bias = idx_scores.masked_fill(~causal, 0.0).clamp(-10.0, 10.0)
         bias = bias.unsqueeze(1)
         return mask, bias
+
+    def forward_decode(self, x_last, k_hist):
+        """增量解码行：x_last (B,1,H)，k_hist (B,S,nh,hd) 历史 k 投影（无 rope，
+        由上层缓存）。返回 (mask (B,1,1,S+1), bias (B,1,1,S+1),
+        k_last (B,1,nh,hd))。末行只依赖查询自身，打分/块选/滑窗与 forward
+        的最后一行逐位同语义，但复杂度 O(S) 而非 O(S²)。"""
+        B = x_last.shape[0]
+        S = k_hist.shape[1] if k_hist is not None else 0
+        S2 = S + 1
+        device = x_last.device
+        bs = self.block_size
+
+        q = self.q_proj(x_last).view(B, 1, self.n_heads, self.head_dim
+                                     ).transpose(1, 2)                 # (B,nh,1,hd)
+        k_last = self.k_proj(x_last).view(B, 1, self.n_heads, self.head_dim)
+        k_all = k_last if k_hist is None else torch.cat(
+            [k_hist, k_last], dim=1)                                   # (B,S+1,nh,hd)
+
+        scores = F.relu(q.float() @ k_all.float().permute(0, 2, 1, 3
+                                  ).transpose(-2, -1)
+                        ) * self.softmax_scale                         # (B,nh,1,S+1)
+        weights = (self.weights_proj(x_last).float() * self.weights_scaling
+                   ).transpose(1, 2).unsqueeze(-1)                     # (B,nh,1,1)
+        idx_scores = (scores * weights).sum(dim=1)                    # (B,1,S+1)
+
+        # token topk（末行全部位置均因果可见）
+        kk = min(self.topk, S2)
+        tok = idx_scores.topk(kk, dim=-1).indices
+        tok_mask = torch.zeros(B, 1, S2, dtype=torch.bool, device=device)
+        tok_mask.scatter_(-1, tok, True)
+
+        # block topk（末行可选全部块）
+        n_real = (S2 + bs - 1) // bs
+        pad_len = n_real * bs - S2
+        padded = F.pad(idx_scores, (0, pad_len), value=float('-inf'))
+        block_scores = padded.view(B, 1, n_real, bs).mean(dim=-1)
+        kb = min(self.topk_blocks, n_real)
+        blk = block_scores.topk(kb, dim=-1).indices
+        blk_mask = torch.zeros(B, 1, n_real, dtype=torch.bool, device=device)
+        blk_mask.scatter_(-1, blk, True)
+        blk_mask = blk_mask.unsqueeze(-1).repeat(1, 1, 1, bs).view(
+            B, 1, n_real * bs)[..., :S2]
+
+        # 滑窗：j ∈ (i-window, i]，i = S2-1
+        diff = (S2 - 1) - torch.arange(S2, device=device)
+        win_mask = (diff >= 0) & (diff < self.window)
+
+        mask = win_mask | tok_mask | blk_mask                     # (B,1,S+1)
+        bias = idx_scores.clamp(-10.0, 10.0)
+        return mask.unsqueeze(1), bias.unsqueeze(1), k_last
 
 
 # ============================================================
@@ -432,7 +483,7 @@ class MiniMLA(nn.Module):
         q = self.q_b_norm(q)
         q = apply_rope(q, cos, sin)                              # (B,Hd,S,hd)
 
-        k = kv.transpose(1, 2).expand(B, self.heads, S, self.head_dim)
+        k = kv.transpose(1, 2).expand(B, self.heads, kv.shape[1], self.head_dim)
         v = k                                                     # K=V
 
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -851,10 +902,11 @@ class V41Block(nn.Module):
     reuse 层从 latents 读 source 的 KV 按自身 ratio 池化。indexer 跨层共享。
     """
 
-    def __init__(self, config, kv_plan, indexer):
+    def __init__(self, config, kv_plan, indexer, layer_id):
         super().__init__()
         c = config
         self.kv_plan = kv_plan                    # ('own', i, r) | ('reuse', j, r)
+        self.layer_id = layer_id
         self.attn_hc = HyperConnection(c.hidden_size, c.hc_mult,
                                        c.hc_sinkhorn_iters, c.hc_eps)
         self.ffn_hc = HyperConnection(c.hidden_size, c.hc_mult,
@@ -868,13 +920,19 @@ class V41Block(nn.Module):
         self._indexer_ref = [indexer]
         self.last_density = 1.0   # 诊断：上次前向可见 token 比例
 
-    def forward(self, X, cos, sin, cos_kv, sin_kv, latents):
+    def forward(self, X, cos, sin, cos_kv, sin_kv, latents, state=None):
         """X: (B,S,N,H) 流；cos/sin 为本层 q 的 rope；cos_kv/sin_kv 为 KV 存储
-        时的 rope 类型；latents: dict，own 层写入 raw KV。返回新流 (B,S,N,H)。"""
+        时的 rope 类型；latents: dict，own 层写入 raw KV。返回新流 (B,S,N,H)。
+        state 非空时缓存本层 collapsed（indexer 输入历史，供增量解码复用）。"""
         B, S, N, H = X.shape
         kind, j, ratio = self.kv_plan
 
         post, comb, collapsed = self.attn_hc(X)
+        if state is not None:
+            # 缓存本层 indexer 的 k 投影（各层输入不同，即使 indexer 共享）
+            idx = self._indexer_ref[0]
+            state['idx_k'][self.layer_id] = idx.k_proj(collapsed).view(
+                B, S, idx.n_heads, idx.head_dim)
         if kind == 'own':
             raw_kv = self.attn.project_kv(collapsed, cos_kv, sin_kv)
             latents[j] = raw_kv
@@ -884,6 +942,34 @@ class V41Block(nn.Module):
 
         mask, bias = self._indexer_ref[0](collapsed)
         self.last_density = mask.float().mean().item()
+        a = self.attn(self.norm1(collapsed), kv, cos, sin, mask, bias)
+        X = (post.to(X.dtype).unsqueeze(-1) * a.unsqueeze(-2)
+             + torch.matmul(comb.to(X.dtype).transpose(-1, -2), X))
+
+        post, comb, collapsed = self.ffn_hc(X)
+        m = self.moe(self.norm2(collapsed))
+        X = (post.to(X.dtype).unsqueeze(-1) * m.unsqueeze(-2)
+             + torch.matmul(comb.to(X.dtype).transpose(-1, -2), X))
+        return X
+
+    def forward_decode(self, X, cos, sin, state):
+        """增量解码单步（S=1）：X (B,1,N,H) 流，返回 (B,1,N,H)。
+        indexer 只算新查询的一行打分（O(S)），KV 追加 own 层 latents。"""
+        kind, j, ratio = self.kv_plan
+        i = self.layer_id
+
+        post, comb, collapsed = self.attn_hc(X)
+        idx = self._indexer_ref[0]
+        mask, bias, k_last = idx.forward_decode(collapsed, state['idx_k'][i])
+        state['idx_k'][i] = torch.cat([state['idx_k'][i], k_last], dim=1)
+        self.last_density = mask.float().mean().item()
+
+        if kind == 'own':
+            raw = self.attn.project_kv(collapsed, cos, sin)
+            state['latents'][i] = torch.cat([state['latents'][i], raw], dim=1)
+            kv = causal_pool_read(state['latents'][i], ratio)
+        else:
+            kv = causal_pool_read(state['latents'][j], ratio)
         a = self.attn(self.norm1(collapsed), kv, cos, sin, mask, bias)
         X = (post.to(X.dtype).unsqueeze(-1) * a.unsqueeze(-2)
              + torch.matmul(comb.to(X.dtype).transpose(-1, -2), X))
@@ -941,7 +1027,7 @@ class MiniV41ForCausalLM(PreTrainedModel, GenerationMixin):
         self.indexers = nn.ModuleList([built[i] for i in sorted(built)])
 
         self.blocks = nn.ModuleList([
-            V41Block(c, kv_plans[i], indexer_of[i])
+            V41Block(c, kv_plans[i], indexer_of[i], i)
             for i in range(c.num_hidden_layers)
         ])
 
@@ -968,11 +1054,19 @@ class MiniV41ForCausalLM(PreTrainedModel, GenerationMixin):
             nn.init.zeros_(module.base)
             nn.init.ones_(module.scale)
 
-    def forward(self, input_ids=None, labels=None, **kwargs):
+    def forward(self, input_ids=None, labels=None, state=None, **kwargs):
+        """state 非空时作为 KV 缓存容器被填充（idx_k: 各层 indexer 的 k 投影
+        历史，latents: own 层 raw KV），供 decode_step 增量解码复用。"""
         c = self.config
         B, S = input_ids.shape
         device = input_ids.device
         dtype = self.embed.weight.dtype
+
+        if state is not None:
+            state.setdefault('idx_k', {})
+            state.setdefault('latents', {})
+            state['pos'] = S
+            state['ids'] = input_ids
 
         # 两套 rope 缓存：main / compress（官方双 rope 语义）
         caches = {name: rope_cache(S, c.qk_rope_head_dim, theta, device, dtype)
@@ -983,13 +1077,13 @@ class MiniV41ForCausalLM(PreTrainedModel, GenerationMixin):
         engram_map = dict(zip(c.engram_layer_ids, self.engrams))
         X = x.unsqueeze(2).expand(-1, -1, c.hc_mult, -1).contiguous()
 
-        latents = {}
+        latents = {} if state is None else state['latents']  # 缓存模式下即 state 容器
         for i, block in enumerate(self.blocks):
             name = "compress" if self.rope_is_compress[i] else "main"
             cos, sin = caches[name]
             if i in engram_map:
                 X = X + engram_map[i](input_ids).unsqueeze(2)
-            X = block(X, cos, sin, *caches[name], latents)
+            X = block(X, cos, sin, *caches[name], latents, state)
 
         h = self.norm_f(self.hc_head(X))
         logits = self.lm_head(h)
@@ -1017,6 +1111,55 @@ class MiniV41ForCausalLM(PreTrainedModel, GenerationMixin):
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {"input_ids": input_ids}
+
+    def decode_step(self, input_ids, state):
+        """增量解码一步：input_ids (B,1) 新 token -> logits (B,1,V)。
+        state 由 prefill（forward 传 state=...）创建并在此原地更新。"""
+        c = self.config
+        device = input_ids.device
+        dtype = self.embed.weight.dtype
+        pos = state['pos']                       # 新 token 的绝对位置
+        caches = {}
+        for name, theta in (("main", c.rope_theta),
+                            ("compress", c.compress_rope_theta)):
+            cos, sin = rope_cache(pos + 1, c.qk_rope_head_dim, theta,
+                                  device, dtype)
+            caches[name] = (cos[-1:], sin[-1:])   # 只取新位置
+        state['ids'] = torch.cat([state['ids'], input_ids], dim=1)
+        state['pos'] = pos + 1
+
+        x = self.embed(input_ids)
+        engram_map = dict(zip(c.engram_layer_ids, self.engrams))
+        X = x.unsqueeze(2).expand(-1, -1, c.hc_mult, -1).contiguous()
+        for i, block in enumerate(self.blocks):
+            name = "compress" if self.rope_is_compress[i] else "main"
+            cos, sin = caches[name]
+            if i in engram_map:
+                # 结尾 n-gram 只依赖最后 max_ngram 个 token（不足时 0 填充，
+                # 与全量前向语义一致），取窗口末位输出
+                window = state['ids'][:, -c.engram_max_ngram_size:]
+                X = X + engram_map[i](window)[:, -1:].unsqueeze(2)
+            X = block.forward_decode(X, cos, sin, state)
+
+        h = self.norm_f(self.hc_head(X))
+        return self.lm_head(h)
+
+    @torch.no_grad()
+    def generate_cached(self, input_ids, max_new_tokens=32, eos_token_id=None):
+        """KV 缓存贪心生成：prefill 全 prompt 一次 + 逐步增量解码。
+        结果与逐 token 全量前向的贪心生成一致（fp32 下逐位）。
+        注意：eos 判断用 .item()，仅支持 B=1。"""
+        state = {}
+        logits = self(input_ids, state=state).logits
+        nxt = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        outs = []
+        for _ in range(max_new_tokens):
+            if eos_token_id is not None and nxt.item() == eos_token_id:
+                break
+            outs.append(nxt)
+            nxt = self.decode_step(nxt, state)[:, -1, :].argmax(dim=-1,
+                                                                keepdim=True)
+        return torch.cat([input_ids] + outs, dim=-1)
 
     @torch.no_grad()
     def update_expert_balance(self, lr=0.01):

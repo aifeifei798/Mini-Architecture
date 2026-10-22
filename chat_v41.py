@@ -3,6 +3,7 @@
 用法：.venv/bin/python chat_v41.py   （先跑 train_v41.py）
 """
 
+import os
 import sys
 import time
 
@@ -11,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model_v41 import MiniV41ForCausalLM   # 注册 deepseek_v41_mini（必须先于加载）
 
-MODEL_DIR = "./my_deepseek_v41_mini"
+MODEL_DIR = os.environ.get("MODEL_DIR", "./my_deepseek_v41_mini")
 device = ("cuda" if torch.cuda.is_available() else
           "mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -60,18 +61,20 @@ if __name__ == "__main__":
             print("DeepSeek-V4.1-Mini ❯ ", end="", flush=True)
 
             gen = []
+            state = {}
             with torch.no_grad():
-                for _ in range(30):
-                    out = model(input_ids)
-                    nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                out = model(input_ids, state=state)      # prefill：全 prompt 一次
+                nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                for _ in range(30):                      # 之后每 token 增量解码
                     if nxt.item() == tokenizer.eos_token_id:
                         break
                     gen.append(nxt.item())
-                    input_ids = torch.cat([input_ids, nxt], dim=-1)
                     sys.stdout.write(tokenizer.decode([nxt.item()],
                                                       skip_special_tokens=True))
                     sys.stdout.flush()
                     time.sleep(0.04)
+                    nxt = model.decode_step(nxt, state)[
+                        :, -1, :].argmax(dim=-1, keepdim=True)
             print()
 
             if gen:
