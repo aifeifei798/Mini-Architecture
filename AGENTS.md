@@ -15,8 +15,10 @@
 ## 文件分工
 
 - `model_v41.py` / `train_v41.py` / `chat_v41.py` / `data_v41.py` — V4.1 主线，见下节
+- `data_long.py` / `train_long.py` / `ablate_long.py` — v3 长上下文主线，见「v3」节
 - `test/smoke_v41.py` — 冒烟测试（causality + S 扫描 + 诊断 API，CPU 可跑）；
-  `test/moe_eq_test.py` — MoE Triton vs einsum 参考路径等价测试（需 CUDA）
+  `test/moe_eq_test.py` — MoE Triton vs einsum 参考路径等价测试（需 CUDA）；
+  `test/kv_cache_test.py` — KV cache 增量解码 vs 全量前向贪心一致 + 计时（需 CUDA）
 - 官方对照参考（只读）：`.venv/lib/python3.12/site-packages/transformers/models/deepseek_v4/`
   （V4.0 建模与 config 源码，v2 校准依据；V4.1 独有字段官方无源码）
 - `tokenizer/` — DeepSeek 系 tokenizer（`PreTrainedTokenizerFast`，vocab 129280）
@@ -70,6 +72,43 @@
   `.venv/bin/python test/moe_eq_test.py`——monkeypatch `model_v41.HAS_TRITON`
   切换 Triton 与 einsum 参考两条路径，前向 + 对 x/全部专家参数的梯度逐一 allclose
   （fp32 下前向应逐位一致，bf16 走 autocast 容差 2e-2；需 CUDA）
+
+## v3 长上下文（minimind 语料，S=512）
+
+数据：`./minimind_dataset/{pretrain,sft}_t2t_mini.jsonl`（2.8G，不入库）。
+`data_long.py` 流式 reservoir 采样（pretrain 10 万条 / sft 5 万条），eos 打包
+S=512 窗口 → `data_long/*.bin`（uint32 memmap，vocab 129280 超 2^16 不能用
+uint16）+ meta.json，同 seed 可复现。
+
+`train_long.py`：随机起点切窗全标签 LM，BATCH=16（8192 tok/步）；预训练
+5000 步（余弦 1.5e-3 + warmup 200）→ SFT 3000 步（独立低 LR 1.5e-4），
+两阶段各用自己的 val 门控 best 保存到 `./my_deepseek_v41_long`，
+`SFT_ONLY=True` 从该目录加载只跑 SFT。
+
+- 基线（v3.1 滑窗修复后）：pretrain val 5.369（ppl 215）→ SFT val 5.009
+  （ppl 150），~33 分钟；indexer 密度 @S=512 ≈ 0.065（S=48 时 0.4）
+- ablation（`ablate_long.py`，同预算同 val 批次，逐配置落盘
+  `ablate/results.json`，删某项重跑即续）：dense 5.348 < idx32 5.545 <
+  base 5.648 < no_engram 5.701 < idx4 5.733 < no_reuse 5.936。稀疏权衡单调；
+  跨层 KV 复用最大单项（-0.29）；engram 3% 参数换 0.05。注意 `compress_ratios`
+  兼任 indexer 归属（ratio=0 的层自持 indexer），no_reuse 参数 +0.08M
+- KV cache：`forward(state=...)` prefill 填 `idx_k`（各层 indexer 的 k 投影）
+  与 `latents`（own 层 raw KV）；`decode_step` 每 token O(S)（indexer
+  `forward_decode` 只算新查询一行）；`generate_cached` 贪心封装。
+  与全量前向逐位同语义（`test/kv_cache_test.py`）。S≤512 下两路径都是
+  kernel launch 开销主导，实测 ~1.1×——正确性看 token 一致性，别看这个数
+- chat_v41：`MODEL_DIR` 环境变量切 checkpoint（默认 ./my_deepseek_v41_mini）
+
+v3 陷阱：
+
+- **v3.1 滑窗修复**：SparseIndexer 滑窗 diff 曾误写 j-i，`& causal` 后整个
+  sliding_window=16 退化为只看自己；修为 i-j 后 pretrain val 5.65→5.37。
+  修复前 checkpoint 与新语义不匹配（尤其缓存解码），已全部重训；ablation
+  表是修复前语义跑的（配置间同语义仍可比）
+- SFT 阶段必须用 sft val 门控 + 低 LR（1.5e-4 级）：第一版拿 pretrain val
+  评 SFT、LR 又高，SFT 结果被 best 逻辑整个丢掉且泛化倒退
+- MoE 专家路由在该语料上坍缩为每层固定 2 专家（0.50/0.50），noaux_tc 偏置
+  修正推不开——已知现象，未解
 
 ## 陷阱（改动前必读）
 
