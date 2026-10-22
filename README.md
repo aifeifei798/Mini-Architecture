@@ -73,3 +73,7 @@ indexer 密度 ~0.31。
 - Python 3.12 + torch 2.14（CUDA 13）+ transformers 5.20，venv 由 uv 构建
 - triton 随 torch 自带（MoE grouped GEMM 分发用，无需另装）
 - 无 requirements.txt：依赖以 `.venv` 为准，缺包用 uv 装
+
+## 协议
+
+[MIT](./LICENSE)
