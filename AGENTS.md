@@ -1,6 +1,6 @@
 # AGENTS.md
 
-微型 DeepSeek 风格 MoE LLM 玩具项目，无包结构、无测试、无 CI、无 requirements.txt。除下述陷阱外没有隐藏约定。
+微型 DeepSeek 风格 MoE LLM 玩具项目，无包结构、无 CI、无 requirements.txt；`test/` 是两个直接运行的验证脚本（无 pytest）。除下述陷阱外没有隐藏约定。
 
 布局：根目录 `*_v41.py` 是 **V4.1 最小架构（研究主线）**；`legacy/` 是第一代 `deepseek_pro_mini` 旧版（只读对照，详见 `legacy/README.md`）。
 
@@ -15,6 +15,8 @@
 ## 文件分工
 
 - `model_v41.py` / `train_v41.py` / `chat_v41.py` / `data_v41.py` — V4.1 主线，见下节
+- `test/smoke_v41.py` — 冒烟测试（causality + S 扫描 + 诊断 API，CPU 可跑）；
+  `test/moe_eq_test.py` — MoE Triton vs einsum 参考路径等价测试（需 CUDA）
 - 官方对照参考（只读）：`.venv/lib/python3.12/site-packages/transformers/models/deepseek_v4/`
   （V4.0 建模与 config 源码，v2 校准依据；V4.1 独有字段官方无源码）
 - `tokenizer/` — DeepSeek 系 tokenizer（`PreTrainedTokenizerFast`，vocab 129280）
@@ -27,7 +29,7 @@
 `model_type = "deepseek_v41_mini"`，用 `AutoModelForCausalLM.from_pretrained`
 加载前必须先 `import model_v41`（注册），否则 KeyError。
 
-- 命令：`.venv/bin/python train_v41.py`（20 条数据，300 epochs ~58s，产出
+- 命令：`.venv/bin/python train_v41.py`（20 条数据，300 epochs ~45s，产出
   `./my_deepseek_v41_mini`）→ `.venv/bin/python chat_v41.py`（交互 + 专家/indexer 诊断）
 - v2 已按 transformers 5.20.2 内置官方 `deepseek_v4` 源码（V4.0）逐组件校准：
   - mHC：每子层（attn/ffn）各一个 `HyperConnection`，单 fn 参数产 pre/post/comb，
@@ -62,11 +64,12 @@
   本体 3.56M 参数（总 36.7M 含 embed+head）
 - 修 meta 设备陷阱：`from_pretrained` 会把普通属性留在 meta 设备，
   `MiniMoE._ensure_counts()` 懒重建统计张量——别直接碰 `_sel_counts`
-- 冒烟方法：causality 断言（改未来 token → 前缀 logits diff < 1e-4）+
-  S ∈ {1,3,7,48,49} 前向/反向有限（含 MTP 损失路径），改模型后先跑这个再训练；
-  改 MoE 还要跑等价测试：monkeypatch `model_v41.HAS_TRITON` 切换 Triton 与
-  einsum 参考两条路径，前向 + 对 x/全部专家参数的梯度逐一 allclose
-  （fp32 下前向应逐位一致，bf16 走 autocast 容差 2e-2）
+- 冒烟方法：`.venv/bin/python test/smoke_v41.py`（causality 断言：改未来 token →
+  前缀 logits diff < 1e-4；S ∈ {1,3,7,48,49} 前向/反向有限，含 MTP 损失路径，
+  CPU 可跑），改模型后先跑这个再训练；改 MoE 还要跑
+  `.venv/bin/python test/moe_eq_test.py`——monkeypatch `model_v41.HAS_TRITON`
+  切换 Triton 与 einsum 参考两条路径，前向 + 对 x/全部专家参数的梯度逐一 allclose
+  （fp32 下前向应逐位一致，bf16 走 autocast 容差 2e-2；需 CUDA）
 
 ## 陷阱（改动前必读）
 
