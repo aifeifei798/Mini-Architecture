@@ -127,7 +127,6 @@ launch 次数主导，实测加速仅 ~1.1×；收益（O(n·S²)→O(n·S)）�
 | `ablate_long.py` | 6 配置同预算 ablation（KV 复用/稀疏度/engram），results.json 断点续跑 |
 | `test/` | 冒烟 + MoE Triton 等价 + KV cache 一致性测试 |
 | `tokenizer/` | DeepSeek 系 tokenizer（`PreTrainedTokenizerFast`，vocab 129280）|
-| `legacy/` | 第一代实现（只读对照，见 `legacy/README.md`）|
 
 ## 环境
 

@@ -1,15 +1,13 @@
 # AGENTS.md
 
-微型 DeepSeek 风格 MoE LLM 玩具项目，无包结构、无 CI、无 requirements.txt；`test/` 是两个直接运行的验证脚本（无 pytest）。除下述陷阱外没有隐藏约定。
+微型 DeepSeek 风格 MoE LLM 玩具项目，无包结构、无 CI、无 requirements.txt；`test/` 是三个直接运行的验证脚本（无 pytest）。除下述陷阱外没有隐藏约定。
 
-布局：根目录 `*_v41.py` 是 **V4.1 最小架构（研究主线）**；`legacy/` 是第一代 `deepseek_pro_mini` 旧版（只读对照，详见 `legacy/README.md`）。
+布局：根目录 `*_v41.py` 是 **V4.1 最小架构（研究主线）**，`*_long.py` 是 **v3 长上下文主线**。（第一代 `deepseek_pro_mini` 旧版已移除，见 git 历史。）
 
 ## 环境与运行
 
 - 用项目自带 venv 运行：`.venv/bin/python`（uv 建的，Python 3.12.3、torch 2.14.1+cu130、transformers 5.20.2，CUDA 已验证可用）。系统 python3 没有 torch。
-- 无参数解析。主线：`.venv/bin/python train_v41.py` → `.venv/bin/python chat_v41.py`。
-- 旧版（**必须从仓库根目录执行**，脚本内路径全按 CWD 解析）：
-  `.venv/bin/python legacy/train.py` → `.venv/bin/python legacy/chat.py`。
+- 无参数解析。主线：`.venv/bin/python train_v41.py` → `.venv/bin/python chat_v41.py`；长上下文：`data_long.py` → `train_long.py`。
 - tokenizer 统一从 `tokenizer/` 子目录加载（vocab 129280）。模型产物不入库。
 
 ## 文件分工
@@ -22,7 +20,6 @@
 - 官方对照参考（只读）：`.venv/lib/python3.12/site-packages/transformers/models/deepseek_v4/`
   （V4.0 建模与 config 源码，v2 校准依据；V4.1 独有字段官方无源码）
 - `tokenizer/` — DeepSeek 系 tokenizer（`PreTrainedTokenizerFast`，vocab 129280）
-- `legacy/` — 旧版三件套 `train.py`（训练→`./my_deepseek_pro_model`）/ `chat.py`（对话+热力图）/ `data.py`（100 条问答），以及 `README.md` 说明
 
 ## V4.1 最小架构（`*_v41` 文件，研究主线）
 
@@ -112,12 +109,5 @@ v3 陷阱：
 
 ## 陷阱（改动前必读）
 
-1. **旧版架构在 `legacy/train.py` 和 `legacy/chat.py` 里整段复制**（约 150 行：`MiniDeepSeekConfig` / `BoundedSwiGLU` / `DeepSeekMiniMoE` / `MiniMLA` / `DeepSeekProBlock` / `ToyDeepSeekProForCausalLM`）。改架构必须**两个文件同步改**，否则 chat.py 加载不了训练产物。唯一有意差异：train.py 的 forward 计算 loss，chat.py 的固定返回 `loss=None`。
-2. **不要让 `legacy/chat.py` 改成 import `legacy/train.py`**：train.py 在模块级（非 `__main__` 块内）就加载 tokenizer、构建 GPU 数据集——import 会触发整条训练前置流程。当前的复制粘贴是刻意的自包含。
-3. **`legacy/train.py` 实际只能在 CUDA 上跑**：虽注释称硬件自适应，但无条件用 `torch.cuda.Event` 计时 + `torch.cuda.synchronize()`，非 CUDA 机器直接崩。`legacy/chat.py` 的 cpu/mps 回退是真实的。
-4. **数据格式耦合**（新旧版同）：用 `text.split(" 答：")`（「答」前有一个半角空格）切分问答。往 `data.py`/`data_v41.py` 加样本必须保持这个精确分隔符，否则解包报错。Prompt 段 label 置 -100（只学答案），序列截断到 48 token。
-5. HF 自定义类在**模块导入时注册**，这是 `from_pretrained` 能识别架构的前提：旧版是 `deepseek_pro_mini`（legacy 两脚本各注册一遍、独立进程，别合并），主线是 `deepseek_v41_mini`（只在 `model_v41.py` 注册）。
-
-## 旧版模型速览（`legacy/`，仅对照）
-
-tiny 尺寸（hidden 128、2 层、vocab 由 tokenizer 决定）：MLA 式低秩 q/kv/o 投影注意力（**无 RoPE**，就是缩放点积因果注意力）+ MoE FFN（4 个 routed 专家取 top-2，输出乘 `routed_scaling_factor=2.5`，外加 1 个 shared 专家）+ `BoundedSwiGLU`（激活 clamp 到 ±10）+ RMSNorm。`model_type = "deepseek_pro_mini"`。chat.py 生成为贪心 argmax，每轮最多 30 token，无采样参数。
+1. **数据格式耦合**：用 `text.split(" 答：")`（「答」前有一个半角空格）切分问答。往 `data_v41.py` 加样本必须保持这个精确分隔符，否则解包报错。Prompt 段 label 置 -100（只学答案），序列截断到 48 token。
+2. HF 自定义类在**模块导入时注册**，这是 `from_pretrained` 能识别架构的前提：`deepseek_v41_mini` 只在 `model_v41.py` 注册，加载前必须 `import model_v41`。
