@@ -1,3 +1,4 @@
 .venv/
 __pycache__/
 my_deepseek_pro_model/
+my_deepseek_v41_mini/

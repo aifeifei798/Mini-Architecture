@@ -16,6 +16,26 @@
 - `data.py` — 纯数据：`raw_data` 列表，100 条中文问答，格式 `"问：xxx 答：yyy"`
 - `tokenizer/` — DeepSeek 系 tokenizer（`PreTrainedTokenizerFast`，vocab 129280）
 
+## V4.1 最小架构（`*_v41` 文件，研究主线）
+
+复现官方 deepseek_v41 config 的最小版（无 vision、无 fp8 量化），**架构只写一份**：
+`model_v41.py` 是唯一源，`train_v41.py`/`chat_v41.py` 都 import 它（不复制粘贴）。
+`model_type = "deepseek_v41_mini"`，用 `AutoModelForCausalLM.from_pretrained`
+加载前必须先 `import model_v41`（注册），否则 KeyError。
+
+- 命令：`.venv/bin/python train_v41.py`（20 条数据，300 epochs ~48s，产出
+  `./my_deepseek_v41_mini`）→ `.venv/bin/python chat_v41.py`（交互 + 专家/indexer 诊断）
+- 已实现组件：MLA（q/kv/o 低秩 + 解耦 RoPE + o 分组）、MoE（sqrtsoftplus +
+  noaux_tc 均衡偏置 + norm_topk）、稀疏注意力（滑窗16 ∪ topk8 token ∪ topk4 block）、
+  Hyper-Connections（4 路残差流 + Sinkhorn）、跨层 KV 复用（source 层 2/6 + 池化压缩）
+- 验收基线：train loss 0.0089，4 条训练内 prompt greedy 全命中，indexer 密度 ~0.30
+- `model_v41.py` 内 [INFERRED] 标注处为按命名推断（无官方源码）；v2 字段
+  `num_nextn_predict_layers`/`engram_*`/`dspark_*` 只在 config 占位，传非空不生效
+- 修 meta 设备陷阱：`from_pretrained` 会把普通属性留在 meta 设备，
+  `MiniMoE._ensure_counts()` 懒重建统计张量——别直接碰 `_sel_counts`
+- 冒烟方法：causality 断言（改未来 token → 前缀 logits diff < 1e-4）+
+  S ∈ {1,3,7,48,49} 前向有限，改模型后先跑这个再训练
+
 ## 陷阱（改动前必读）
 
 1. **模型架构在 train.py 和 chat.py 里整段复制**（约 150 行：`MiniDeepSeekConfig` / `BoundedSwiGLU` / `DeepSeekMiniMoE` / `MiniMLA` / `DeepSeekProBlock` / `ToyDeepSeekProForCausalLM`）。改架构必须**两个文件同步改**，否则 chat.py 加载不了训练产物。唯一有意差异：train.py 的 forward 计算 loss，chat.py 的固定返回 `loss=None`。
